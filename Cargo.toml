@@ -1,0 +1,37 @@
+[package]
+name = "github-stars-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["GitHub Stars Server"]
+description = "A server that processes GitHub repository stargazers in the background"
+keywords = ["github", "api", "server", "async", "surrealdb"]
+categories = ["web-programming", "database"]
+
+[lib]
+name = "github_stars_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "github-stars-server"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive", "env"] }
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+url = "2.4"
+anyhow = "1.0"
+thiserror = "1.0"
+colored = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+dotenv = "0.15"
+ractor = "0.13"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+surrealdb = { version = "2.3", features = ["protocol-ws", "protocol-http"] }
+futures = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"

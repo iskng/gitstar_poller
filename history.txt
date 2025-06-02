@@ -1,0 +1,31 @@
+#V2
+SELECT * FROM repo_processing_status LIMIT 5;
+SELECT * FROM repo_processing_status WHERE status = 'completed' LIMIT 3;
+SELECT * FROM repo_processing_status LIMIT 1;
+INFO FOR TABLE repo_processing_status;
+SELECT * FROM repo_processing_status LIMIT 1;
+SELECT id, id.tb as table_name, id.id as record_id FROM repo LIMIT 3;
+DELETE repo_processing_status WHERE id CONTAINS '⟨⟨' OR id CONTAINS '⟩⟩';
+SELECT count() as total FROM repo_processing_status GROUP ALL;
+SELECT * FROM repo_processing_status WHERE repo = repo:⟨0xPlaygrounds/rig⟩;
+DELETE repo_processing_status;
+SELECT id, repo FROM repo_processing_status LIMIT 3;
+SELECT id.id as id_part, repo.id as repo_part FROM repo LIMIT 1;
+SELECT meta::id(repo) as meta_id, meta::tb(repo) as table_name FROM repo:⟨0xPlaygrounds/rig⟩;
+SELECT count() as total, count(status = 'completed') as completed, count(status = 'processing') as processing FROM repo_processing_status GROUP ALL;
+-- Define the github_user table
+DEFINE TABLE github_user SCHEMAFULL;
+DEFINE FIELD githubId ON TABLE github_user TYPE int;
+DEFINE FIELD username ON TABLE github_user TYPE string;
+DEFINE FIELD avatarUrl ON TABLE github_user TYPE string;
+DEFINE FIELD profileUrl ON TABLE github_user TYPE string;
+DEFINE FIELD syncedAt ON TABLE github_user TYPE datetime;
+-- Index for fast lookups
+DEFINE INDEX githubUsernameIndex ON TABLE github_user COLUMNS username UNIQUE;
+DEFINE INDEX githubIdIndex ON TABLE github_user COLUMNS githubId UNIQUE;
+SELECT * FROM github_user LIMIT 2;
+UPDATE github_user SET syncedAt = time::from::unix(time::unix(syncedAt));
+UPDATE github_user SET syncedAt = <datetime>syncedAt;
+SELECT count() as total FROM stargazer GROUP ALL;
+DELETE stargazer;
+SELECT count() as stargazer_count FROM stargazer GROUP ALL; SELECT count() as starred_count FROM starred GROUP ALL; SELECT count() as github_user_count FROM github_user GROUP ALL;
