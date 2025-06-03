@@ -2,9 +2,15 @@ use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "github-stars-server")]
-#[command(about = "GitHub Stars Processing Server - Processes repository stargazers in the background")]
+#[command(
+    about = "GitHub Stars Processing Server - Processes repository stargazers in the background"
+)]
 #[command(version = "0.1.0")]
 pub struct Cli {
+    /// Use local development settings (sets DB URL to ws://localhost:8000)
+    #[arg(long)]
+    pub local: bool,
+
     /// SurrealDB connection URL
     #[arg(long, env = "DB_URL", default_value = "ws://localhost:8000")]
     pub db_url: String,

@@ -13,7 +13,7 @@ use clap::Parser;
 use cli::Cli;
 use colored::*;
 use error::{ GitHubStarsError, Result };
-use pool::{create_pool, PoolConfig, SurrealConnectionConfig};
+use pool::{ create_pool, PoolConfig, SurrealConnectionConfig };
 use std::sync::Arc;
 
 #[tokio::main]
@@ -24,7 +24,13 @@ async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // Override db_url if --local flag is set
+    if cli.local {
+        cli.db_url = "ws://localhost:8000".to_string();
+        println!("{}", "Running in local mode (DB URL: ws://localhost:8000)".yellow());
+    }
 
     println!("{}", "GitHub Stars Processing Server".bold().green());
     println!("{}\n", "=".repeat(50).dimmed());
@@ -47,16 +53,21 @@ async fn main() -> Result<()> {
     };
 
     // Create connection pool
-    let db_pool = Arc::new(create_pool(connection_config, pool_config)
-        .map_err(|e| GitHubStarsError::ApiError(format!("Failed to create connection pool: {}", e)))?)
-    ;
+    let db_pool = Arc::new(
+        create_pool(connection_config, pool_config).map_err(|e|
+            GitHubStarsError::ApiError(format!("Failed to create connection pool: {}", e))
+        )?
+    );
 
     println!("✅ Created SurrealDB connection pool with {} connections", cli.db_pool_max_size);
 
     // Query for accounts to determine actual worker count
-    let db_conn = db_pool.get().await
-        .map_err(|e| GitHubStarsError::ApiError(format!("Failed to get connection from pool: {}", e)))?;
-    
+    let db_conn = db_pool
+        .get().await
+        .map_err(|e|
+            GitHubStarsError::ApiError(format!("Failed to get connection from pool: {}", e))
+        )?;
+
     let accounts = db_conn
         .get_github_accounts(100).await
         .map_err(|e| GitHubStarsError::ApiError(format!("Failed to query accounts: {}", e)))?;
