@@ -14,7 +14,6 @@ use crate::models::{
     RepoProcessingStatus,
     User,
     GithubUser,
-    StarredRelation,
 };
 
 #[derive(Clone, Debug)]

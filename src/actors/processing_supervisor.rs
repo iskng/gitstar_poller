@@ -5,7 +5,7 @@ use crate::actors::github_factory::{
 };
 use crate::actors::github_worker::{ GitHubJobKey, GitHubJobPayload };
 use crate::models::NewAccountEvent;
-use crate::surreal_client::SurrealClient;
+use crate::pool::SurrealPool;
 use anyhow::Result;
 use ractor::{
     Actor,
@@ -25,7 +25,7 @@ pub struct ProcessingSupervisor;
 
 /// State for the processing supervisor
 pub struct ProcessingSupervisorState {
-    db_client: Arc<SurrealClient>,
+    db_pool: Arc<SurrealPool>,
     factory: ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>,
     total_accounts_processed: u64,
 }
@@ -50,7 +50,7 @@ pub struct ProcessingStats {
 
 /// Arguments for starting the supervisor
 pub struct ProcessingSupervisorArgs {
-    pub db_client: Arc<SurrealClient>,
+    pub db_pool: Arc<SurrealPool>,
     pub factory_config: GitHubFactoryConfig,
     pub account_receiver: mpsc::Receiver<NewAccountEvent>,
 }
@@ -58,18 +58,20 @@ pub struct ProcessingSupervisorArgs {
 impl ProcessingSupervisor {
     /// Spawn the supervisor with live query integration
     pub async fn spawn_with_live_query(
-        db_client: SurrealClient,
+        db_pool: Arc<SurrealPool>,
         factory_config: GitHubFactoryConfig
     ) -> Result<ActorRef<ProcessingSupervisorMessage>, SpawnErr> {
-        let db_client_arc = Arc::new(db_client);
+        // Get a connection from the pool to set up live query
+        let db_conn = db_pool.get().await
+            .map_err(|e| SpawnErr::StartupFailed(format!("Failed to get connection from pool: {}", e).into()))?;
 
         // Set up live query for new accounts
-        let account_receiver = db_client_arc
+        let account_receiver = db_conn
             .setup_account_live_query().await
             .map_err(|e| SpawnErr::StartupFailed(e.to_string().into()))?;
 
         let args = ProcessingSupervisorArgs {
-            db_client: db_client_arc,
+            db_pool,
             factory_config,
             account_receiver,
         };
@@ -97,7 +99,7 @@ impl Actor for ProcessingSupervisor {
         // Spawn the GitHub processing factory
         let factory = spawn_github_factory(
             args.factory_config,
-            args.db_client.clone()
+            args.db_pool.clone()
         ).await.map_err(|e| ActorProcessingErr::from(format!("Failed to spawn factory: {}", e)))?;
 
         // Spawn task to forward live query events to the actor
@@ -119,38 +121,46 @@ impl Actor for ProcessingSupervisor {
         });
 
         // Load and process existing accounts
-        let db_client = args.db_client.clone();
+        let db_pool = args.db_pool.clone();
         let factory_clone = factory.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_existing_accounts(db_client, factory_clone).await {
+            if let Err(e) = process_existing_accounts(db_pool, factory_clone).await {
                 error!("Failed to process existing accounts: {}", e);
             }
         });
 
         // Spawn periodic cleanup task for stale claims
-        let db_client_cleanup = args.db_client.clone();
+        let db_pool_cleanup = args.db_pool.clone();
         tokio::spawn(async move {
             let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // Every 5 minutes
             cleanup_interval.tick().await; // Skip first immediate tick
 
             loop {
                 cleanup_interval.tick().await;
-                match db_client_cleanup.reset_stale_claims(60).await {
-                    Ok(count) if count > 0 => {
-                        info!("Reset {} stale repo claims", count);
-                    }
-                    Ok(_) => {
-                        debug!("No stale claims to reset");
+                // Get a connection from the pool for cleanup
+                match db_pool_cleanup.get().await {
+                    Ok(db_conn) => {
+                        match db_conn.reset_stale_claims(60).await {
+                            Ok(count) if count > 0 => {
+                                info!("Reset {} stale repo claims", count);
+                            }
+                            Ok(_) => {
+                                debug!("No stale claims to reset");
+                            }
+                            Err(e) => {
+                                error!("Failed to reset stale claims: {}", e);
+                            }
+                        }
                     }
                     Err(e) => {
-                        error!("Failed to reset stale claims: {}", e);
+                        error!("Failed to get connection for cleanup: {}", e);
                     }
                 }
             }
         });
 
         Ok(ProcessingSupervisorState {
-            db_client: args.db_client,
+            db_pool: args.db_pool,
             factory,
             total_accounts_processed: 0,
         })
@@ -171,14 +181,14 @@ impl Actor for ProcessingSupervisor {
                 );
 
                 // Wait for repo sync to stabilize before processing
-                let db_client = state.db_client.clone();
+                let db_pool = state.db_pool.clone();
                 let factory = state.factory.clone();
                 let user_id = event.user.id.clone();
                 let access_token = event.account.access_token.clone();
 
                 tokio::spawn(async move {
                     // Wait for repo sync to complete
-                    if let Err(e) = wait_for_repo_sync_completion(&db_client, &user_id).await {
+                    if let Err(e) = wait_for_repo_sync_completion(&db_pool, &user_id).await {
                         error!("Failed to wait for repo sync for user {}: {}", user_id.key(), e);
                         return;
                     }
@@ -186,7 +196,7 @@ impl Actor for ProcessingSupervisor {
                     // Process all repos for this account
                     if
                         let Err(e) = process_account_repos(
-                            &db_client,
+                            &db_pool,
                             &factory,
                             &user_id,
                             &access_token
@@ -265,13 +275,17 @@ impl Actor for ProcessingSupervisor {
 
 /// Process all repos for a given account
 async fn process_account_repos(
-    db_client: &Arc<SurrealClient>,
+    db_pool: &Arc<SurrealPool>,
     factory: &ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>,
     user_id: &RecordId,
     access_token: &str
 ) -> Result<()> {
+    // Get a connection from the pool
+    let db_conn = db_pool.get().await
+        .map_err(|e| anyhow::anyhow!("Failed to get connection from pool: {}", e))?;
+
     // Get all starred repos for this user
-    let mut repos = db_client
+    let mut repos = db_conn
         .get_repos_for_processing(user_id).await
         .map_err(|e| anyhow::anyhow!("Failed to get repos: {}", e))?;
 
@@ -293,7 +307,7 @@ async fn process_account_repos(
         .map(|r| r.full_name.clone())
         .collect();
 
-    let statuses = db_client
+    let statuses = db_conn
         .get_repos_processing_status(&repo_ids).await
         .map_err(|e| anyhow::anyhow!("Failed to get processing statuses: {}", e))?;
 
@@ -352,7 +366,7 @@ async fn process_account_repos(
 
 /// Wait for repo sync to complete by monitoring repo count stability
 async fn wait_for_repo_sync_completion(
-    db_client: &Arc<SurrealClient>,
+    db_pool: &Arc<SurrealPool>,
     user_id: &RecordId
 ) -> Result<()> {
     use tokio::time::{ sleep, Duration };
@@ -374,8 +388,11 @@ async fn wait_for_repo_sync_completion(
             break;
         }
 
+        // Get a connection from the pool
+        let db_conn = db_pool.get().await?;
+        
         // Get current repo count
-        let repos = db_client.get_repos_for_processing(user_id).await?;
+        let repos = db_conn.get_repos_for_processing(user_id).await?;
         let current_count = repos.len();
 
         debug!("User {} currently has {} starred repos", user_id.key(), current_count);
@@ -410,26 +427,29 @@ async fn wait_for_repo_sync_completion(
 
 /// Process existing accounts on startup
 async fn process_existing_accounts(
-    db_client: Arc<SurrealClient>,
+    db_pool: Arc<SurrealPool>,
     factory: ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>
 ) -> Result<()> {
     info!("Processing existing accounts");
 
+    // Get a connection from the pool
+    let db_conn = db_pool.get().await?;
+    
     // Get up to 100 GitHub accounts
-    let accounts = db_client.get_github_accounts(100).await?;
+    let accounts = db_conn.get_github_accounts(100).await?;
 
     info!("Found {} existing GitHub accounts", accounts.len());
 
     for account in accounts {
         // Wait for any ongoing repo sync to complete
-        if let Err(e) = wait_for_repo_sync_completion(&db_client, &account.user_id).await {
+        if let Err(e) = wait_for_repo_sync_completion(&db_pool, &account.user_id).await {
             error!("Failed to wait for repo sync for user {}: {}", account.user_id.key(), e);
             continue;
         }
 
         if
             let Err(e) = process_account_repos(
-                &db_client,
+                &db_pool,
                 &factory,
                 &account.user_id,
                 &account.access_token

@@ -3,6 +3,7 @@ mod cli;
 mod error;
 mod github;
 mod models;
+mod pool;
 mod surreal_client;
 mod types;
 
@@ -12,7 +13,8 @@ use clap::Parser;
 use cli::Cli;
 use colored::*;
 use error::{ GitHubStarsError, Result };
-use surreal_client::SurrealClient;
+use pool::{create_pool, PoolConfig, SurrealConnectionConfig};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -27,25 +29,39 @@ async fn main() -> Result<()> {
     println!("{}", "GitHub Stars Processing Server".bold().green());
     println!("{}\n", "=".repeat(50).dimmed());
 
-    // Connect to SurrealDB
-    let db_client = SurrealClient::new(
-        &cli.db_url,
-        &cli.db_user,
-        &cli.db_pass,
-        &cli.db_namespace,
-        &cli.db_database
-    ).await.map_err(|e|
-        GitHubStarsError::ApiError(format!("Failed to connect to SurrealDB: {}", e))
-    )?;
+    // Configure connection pool
+    let connection_config = SurrealConnectionConfig {
+        url: cli.db_url.clone(),
+        username: cli.db_user.clone(),
+        password: cli.db_pass.clone(),
+        namespace: cli.db_namespace.clone(),
+        database: cli.db_database.clone(),
+    };
 
-    println!("✅ Connected to SurrealDB");
+    // Configure pool based on CLI args or dynamic sizing
+    let pool_config = PoolConfig {
+        max_size: cli.db_pool_max_size,
+        min_idle: Some(cli.db_pool_min_idle),
+        connection_timeout: std::time::Duration::from_secs(cli.db_connection_timeout),
+        ..Default::default()
+    };
 
-    // Query for accounts to determine initial worker count
-    let accounts = db_client
+    // Create connection pool
+    let db_pool = Arc::new(create_pool(connection_config, pool_config)
+        .map_err(|e| GitHubStarsError::ApiError(format!("Failed to create connection pool: {}", e)))?)
+    ;
+
+    println!("✅ Created SurrealDB connection pool with {} connections", cli.db_pool_max_size);
+
+    // Query for accounts to determine actual worker count
+    let db_conn = db_pool.get().await
+        .map_err(|e| GitHubStarsError::ApiError(format!("Failed to get connection from pool: {}", e)))?;
+    
+    let accounts = db_conn
         .get_github_accounts(100).await
         .map_err(|e| GitHubStarsError::ApiError(format!("Failed to query accounts: {}", e)))?;
 
-    // Set initial workers based on accounts found (minimum 5, maximum from accounts)
+    // Set actual workers based on accounts found (minimum 1, maximum from accounts)
     let num_workers = std::cmp::max(1, accounts.len());
 
     println!("📊 Found {} GitHub accounts", accounts.len());
@@ -59,7 +75,7 @@ async fn main() -> Result<()> {
 
     // Start the processing supervisor with live query
     let supervisor = ProcessingSupervisor::spawn_with_live_query(
-        db_client,
+        db_pool.clone(),
         factory_config
     ).await.map_err(|e| GitHubStarsError::ApiError(format!("Failed to start supervisor: {}", e)))?;
 

@@ -12,7 +12,7 @@ use crate::actors::github_worker::{
     GitHubJobKey,
     GitHubJobPayload,
 };
-use crate::surreal_client::SurrealClient;
+use crate::pool::SurrealPool;
 
 /// Configuration for the GitHub processing factory
 #[derive(Debug, Clone)]
@@ -62,7 +62,7 @@ impl DiscardHandler<GitHubJobKey, GitHubJobPayload> for GitHubJobDiscardHandler 
 pub type GitHubProcessingFactory = Factory<
     GitHubJobKey,
     GitHubJobPayload,
-    Arc<SurrealClient>, // Worker startup args
+    Arc<SurrealPool>, // Worker startup args
     GitHubWorker,
     routing::StickyQueuerRouting<GitHubJobKey, GitHubJobPayload>, // Sticky routing for same user
     queues::DefaultQueue<GitHubJobKey, GitHubJobPayload>
@@ -71,7 +71,7 @@ pub type GitHubProcessingFactory = Factory<
 /// Spawns a GitHub processing factory
 pub async fn spawn_github_factory(
     config: GitHubFactoryConfig,
-    db_client: Arc<SurrealClient>,
+    db_pool: Arc<SurrealPool>,
 ) -> Result<ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>> {
     info!(
         "Spawning GitHub processing factory with {} initial workers",
@@ -87,7 +87,7 @@ pub async fn spawn_github_factory(
     let router = routing::StickyQueuerRouting::<GitHubJobKey, GitHubJobPayload>::default();
     
     // Create worker builder
-    let worker_builder = GitHubWorkerBuilder::new(db_client);
+    let worker_builder = GitHubWorkerBuilder::new(db_pool);
 
     // Configure dead man's switch
     let dead_mans_switch = ractor::factory::DeadMansSwitchConfiguration {

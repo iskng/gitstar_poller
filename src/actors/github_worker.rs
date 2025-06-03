@@ -1,7 +1,7 @@
 use crate::error::{GitHubStarsError, Result};
 use crate::github::GitHubClient;
 use crate::models::RateLimitState;
-use crate::surreal_client::SurrealClient;
+use crate::pool::SurrealPool;
 use chrono::Utc;
 use ractor::{
     Actor, ActorProcessingErr, ActorRef,
@@ -37,7 +37,7 @@ pub struct GitHubWorker;
 #[derive(Debug)]
 pub struct GitHubWorkerState {
     worker_id: WorkerId,
-    db_client: Arc<SurrealClient>,
+    db_pool: Arc<SurrealPool>,
     jobs_processed: u64,
     rate_limit_state: RateLimitState,
     last_activity: Instant,
@@ -53,7 +53,7 @@ impl GitHubWorker {
 impl Actor for GitHubWorker {
     type Msg = WorkerMessage<GitHubJobKey, GitHubJobPayload>;
     type State = GitHubWorkerState;
-    type Arguments = WorkerStartContext<GitHubJobKey, GitHubJobPayload, Arc<SurrealClient>>;
+    type Arguments = WorkerStartContext<GitHubJobKey, GitHubJobPayload, Arc<SurrealPool>>;
 
     async fn pre_start(
         &self,
@@ -64,7 +64,7 @@ impl Actor for GitHubWorker {
         
         Ok(GitHubWorkerState {
             worker_id: args.wid,
-            db_client: args.custom_start,
+            db_pool: args.custom_start,
             jobs_processed: 0,
             rate_limit_state: RateLimitState::default(),
             last_activity: Instant::now(),
@@ -120,7 +120,7 @@ impl Actor for GitHubWorker {
                             &job_key.repo_id,
                             &repo_full_name,
                             &access_token,
-                            &state.db_client,
+                            &state.db_pool,
                             &mut state.rate_limit_state
                         ).await
                     }
@@ -173,13 +173,17 @@ impl GitHubWorker {
         repo_id: &RecordId,
         repo_full_name: &str,
         access_token: &str,
-        db_client: &Arc<SurrealClient>,
+        db_pool: &Arc<SurrealPool>,
         rate_limit_state: &mut RateLimitState,
     ) -> Result<()> {
         info!("Processing repository {} for user {}", repo_full_name, user_id.key());
 
+        // Get a connection from the pool for this job
+        let db_conn = db_pool.get().await
+            .map_err(|e| GitHubStarsError::ApiError(format!("Failed to get DB connection: {}", e)))?;
+
         // Try to claim the repo for processing
-        match db_client.claim_repo_for_processing(repo_id, user_id).await {
+        match db_conn.claim_repo_for_processing(repo_id, user_id).await {
             Ok(true) => {
                 debug!("Successfully claimed repo {} for processing", repo_full_name);
             }
@@ -216,13 +220,13 @@ impl GitHubWorker {
                     if !stargazers.is_empty() {
                         // Insert stargazers in batch
                         info!("Inserting {} stargazers for repo {}", stargazers_count, repo_full_name);
-                        db_client
+                        db_conn
                             .insert_stargazers_batch(repo_id, &stargazers)
                             .await
                             .map_err(|e| GitHubStarsError::ApiError(format!("Failed to insert stargazers: {}", e)))?;
 
                         // Update processing progress
-                        db_client
+                        db_conn
                             .update_repo_processing_progress(repo_id, page, stargazers_count)
                             .await
                             .map_err(|e| GitHubStarsError::ApiError(format!("Failed to update progress: {}", e)))?;
@@ -246,7 +250,7 @@ impl GitHubWorker {
                     
                     // Update repo status to rate limited
                     let retry_time = rate_limit_state.reset_time;
-                    db_client
+                    db_conn
                         .update_repo_rate_limited(repo_id, retry_time)
                         .await
                         .map_err(|e| GitHubStarsError::ApiError(format!("Failed to update rate limit status: {}", e)))?;
@@ -257,7 +261,7 @@ impl GitHubWorker {
                     error!("Error processing repo {}: {:?}", repo_full_name, e);
                     
                     // Mark repo as failed
-                    db_client
+                    db_conn
                         .mark_repo_processing_failed(repo_id, &e.to_string())
                         .await
                         .map_err(|e2| GitHubStarsError::ApiError(format!("Failed to mark repo as failed: {}", e2)))?;
@@ -268,7 +272,7 @@ impl GitHubWorker {
         }
 
         // Mark repo as complete
-        db_client
+        db_conn
             .mark_repo_processing_complete(repo_id, total_stargazers as u32)
             .await
             .map_err(|e| GitHubStarsError::ApiError(format!("Failed to mark repo complete: {}", e)))?;
@@ -285,17 +289,17 @@ impl GitHubWorker {
 /// Builder for GitHub workers
 #[derive(Debug, Clone)]
 pub struct GitHubWorkerBuilder {
-    db_client: Arc<SurrealClient>,
+    db_pool: Arc<SurrealPool>,
 }
 
 impl GitHubWorkerBuilder {
-    pub fn new(db_client: Arc<SurrealClient>) -> Self {
-        Self { db_client }
+    pub fn new(db_pool: Arc<SurrealPool>) -> Self {
+        Self { db_pool }
     }
 }
 
-impl RactorWorkerBuilder<GitHubWorker, Arc<SurrealClient>> for GitHubWorkerBuilder {
-    fn build(&mut self, _wid: WorkerId) -> (GitHubWorker, Arc<SurrealClient>) {
-        (GitHubWorker::new(), self.db_client.clone())
+impl RactorWorkerBuilder<GitHubWorker, Arc<SurrealPool>> for GitHubWorkerBuilder {
+    fn build(&mut self, _wid: WorkerId) -> (GitHubWorker, Arc<SurrealPool>) {
+        (GitHubWorker::new(), self.db_pool.clone())
     }
 }
