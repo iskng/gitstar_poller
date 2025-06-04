@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
         )?;
 
     let accounts = db_conn
-        .get_github_accounts(100).await
+        .get_github_accounts(100, 0).await
         .map_err(|e| GitHubStarsError::ApiError(format!("Failed to query accounts: {}", e)))?;
 
     // Set actual workers based on accounts found (minimum 1, maximum from accounts)
@@ -132,7 +132,8 @@ async fn main() -> Result<()> {
                 .map_err(|e| GitHubStarsError::ApiError(format!("Failed to shutdown supervisor: {:?}", e)))?;
             
             // Give actors time to clean up
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            println!("Waiting for workers to finish current tasks...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             
             println!("✅ Server stopped");
         }

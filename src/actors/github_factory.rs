@@ -19,6 +19,7 @@ use crate::actors::github_worker::{
     GitHubWorkerBuilder,
     GitHubJobKey,
     GitHubJobPayload,
+    JobPriority,
 };
 use crate::pool::SurrealPool;
 
@@ -63,14 +64,33 @@ impl DiscardHandler<GitHubJobKey, GitHubJobPayload> for GitHubJobDiscardHandler 
     }
 }
 
-/// Type alias for our factory
+/// Priority manager that prioritizes new accounts over existing ones
+#[derive(Debug, Clone)]
+pub struct GitHubPriorityManager;
+
+impl queues::PriorityManager<GitHubJobKey, JobPriority> for GitHubPriorityManager {
+    fn is_discardable(&self, _key: &GitHubJobKey) -> bool {
+        false // Never discard jobs
+    }
+    
+    fn get_priority(&self, key: &GitHubJobKey) -> Option<JobPriority> {
+        // New accounts get high priority, existing accounts get low priority
+        Some(if key.is_new_account {
+            JobPriority::High
+        } else {
+            JobPriority::Low
+        })
+    }
+}
+
+/// Type alias for our factory with priority queue
 pub type GitHubProcessingFactory = Factory<
     GitHubJobKey,
     GitHubJobPayload,
     Arc<SurrealPool>, // Worker startup args
     GitHubWorker,
     routing::StickyQueuerRouting<GitHubJobKey, GitHubJobPayload>, // Sticky routing for same user
-    queues::DefaultQueue<GitHubJobKey, GitHubJobPayload>
+    queues::PriorityQueue<GitHubJobKey, GitHubJobPayload, JobPriority, GitHubPriorityManager, 2> // 2 priority levels
 >;
 
 /// Spawns a GitHub processing factory
@@ -80,10 +100,10 @@ pub async fn spawn_github_factory(
 ) -> Result<ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>> {
     info!("Spawning GitHub processing factory with {} initial workers", config.num_initial_workers);
 
-    // Create queue
-    let queue = queues::DefaultQueue::<GitHubJobKey, GitHubJobPayload>::default();
-    // Note: DefaultQueue in current ractor version doesn't support set_capacity
-    // Using default capacity for now
+    // Create priority queue with our priority manager
+    let queue = queues::PriorityQueue::<GitHubJobKey, GitHubJobPayload, JobPriority, GitHubPriorityManager, 2>::new(
+        GitHubPriorityManager
+    );
 
     // Use sticky routing so same user's repos go to same worker
     let router = routing::StickyQueuerRouting::<GitHubJobKey, GitHubJobPayload>::default();
@@ -127,10 +147,12 @@ pub async fn spawn_github_factory(
 pub async fn submit_account_processing_job(
     factory: &ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>,
     user_id: &surrealdb::RecordId,
-    access_token: String
+    access_token: String,
+    is_new_account: bool,
 ) -> Result<()> {
     let job_key = GitHubJobKey {
         user_id: user_id.clone(),
+        is_new_account,
     };
     let payload = GitHubJobPayload {
         access_token,

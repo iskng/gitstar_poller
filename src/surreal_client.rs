@@ -296,6 +296,25 @@ impl SurrealClient {
         Ok(())
     }
 
+    /// Unclaim a repo (used on worker shutdown or error)
+    pub async fn unclaim_repo(&self, repo_id: &RecordId) -> Result<()> {
+        let query = r#"
+            UPDATE repo_processing_status SET
+                status = 'pending',
+                claimed_by = NULL,
+                claimed_at = NULL
+            WHERE repo = $repo_id
+            AND status = 'processing'
+        "#;
+
+        self.db
+            .query(query)
+            .bind(("repo_id", repo_id.clone()))
+            .await?;
+
+        Ok(())
+    }
+
     /// Update repo status to rate limited
     pub async fn update_repo_rate_limited(
         &self,
@@ -532,17 +551,23 @@ impl SurrealClient {
         Ok(count)
     }
 
-    /// Get GitHub accounts with limit for startup
-    pub async fn get_github_accounts(&self, limit: usize) -> Result<Vec<Account>> {
+    /// Get GitHub accounts with limit and offset for startup
+    pub async fn get_github_accounts(&self, limit: usize, offset: usize) -> Result<Vec<Account>> {
         let query =
             r#"
             SELECT * FROM account 
             WHERE providerId = 'github' 
             AND access_token != NULL
+            ORDER BY id ASC
             LIMIT $limit
+            START $offset
         "#;
 
-        let mut result = self.db.query(query).bind(("limit", limit)).await?;
+        let mut result = self.db
+            .query(query)
+            .bind(("limit", limit))
+            .bind(("offset", offset))
+            .await?;
 
         let accounts: Vec<Account> = result.take(0)?;
         Ok(accounts)

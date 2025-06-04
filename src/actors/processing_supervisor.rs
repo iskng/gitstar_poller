@@ -34,6 +34,8 @@ pub struct ProcessingSupervisorState {
 pub enum ProcessingSupervisorMessage {
     /// New account detected via live query
     NewAccount(NewAccountEvent),
+    /// Start processing existing accounts
+    ProcessExisting,
     /// Get statistics about processing
     GetStats(RpcReplyPort<ProcessingStats>),
     /// Shutdown the system
@@ -119,14 +121,14 @@ impl Actor for ProcessingSupervisor {
             info!("Account live query receiver ended");
         });
 
-        // Load and process existing accounts
-        let db_pool = args.db_pool.clone();
-        let factory_clone = factory.clone();
+        // Send message to start processing existing accounts
+        let myself_clone = myself.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_existing_accounts(db_pool, factory_clone).await {
-                error!("Failed to process existing accounts: {}", e);
-            }
+            // Give the system a moment to fully initialize
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            let _ = myself_clone.send_message(ProcessingSupervisorMessage::ProcessExisting);
         });
+
 
         // Spawn periodic cleanup task for stale claims
         let db_pool_cleanup = args.db_pool.clone();
@@ -179,17 +181,78 @@ impl Actor for ProcessingSupervisor {
                     event.user.name.as_deref().unwrap_or("Unknown")
                 );
 
-                // Submit account processing job - worker will handle sync wait and repo processing
+                // Submit account processing job for new accounts (is_new_account = true)
                 if let Err(e) = submit_account_processing_job(
                     &state.factory,
                     &event.user.id,
-                    event.account.access_token.clone()
+                    event.account.access_token.clone(),
+                    true, // is_new_account
                 ).await {
                     error!("Failed to submit job for new user {}: {}", event.user.id.key(), e);
                 } else {
-                    info!("Submitted account processing job for new user {}", event.user.id.key());
+                    info!("Submitted high priority account processing job for new user {}", event.user.id.key());
                     state.total_accounts_processed += 1;
                 }
+            }
+
+            ProcessingSupervisorMessage::ProcessExisting => {
+                info!("Starting to process existing accounts");
+                
+                // Spawn a task to fetch and submit all existing accounts
+                let db_pool = state.db_pool.clone();
+                let factory = state.factory.clone();
+                
+                tokio::spawn(async move {
+                    // Get a connection from the pool
+                    match db_pool.get().await {
+                        Ok(db_conn) => {
+                            let mut total_submitted = 0;
+                            let mut offset = 0;
+                            let batch_size = 100;
+                            
+                            loop {
+                                // Fetch accounts in batches with offset
+                                match db_conn.get_github_accounts(batch_size, offset).await {
+                                    Ok(accounts) => {
+                                        if accounts.is_empty() {
+                                            info!("Finished submitting all existing accounts. Total: {}", total_submitted);
+                                            break;
+                                        }
+                                        
+                                        info!("Fetched {} existing accounts to process (offset: {})", accounts.len(), offset);
+                                        
+                                        // Submit all existing accounts (is_new_account = false)
+                                        for account in accounts {
+                                            if let Err(e) = submit_account_processing_job(
+                                                &factory,
+                                                &account.user_id,
+                                                account.access_token,
+                                                false, // is_new_account
+                                            ).await {
+                                                error!("Failed to submit job for user {}: {}", account.user_id.key(), e);
+                                            } else {
+                                                total_submitted += 1;
+                                            }
+                                        }
+                                        
+                                        // Update offset for next batch
+                                        offset += batch_size;
+                                        
+                                        // Brief pause between batches to avoid overwhelming the system
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to fetch accounts: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to get DB connection for processing existing accounts: {}", e);
+                        }
+                    }
+                });
             }
 
             ProcessingSupervisorMessage::GetStats(reply) => {
@@ -228,14 +291,20 @@ impl Actor for ProcessingSupervisor {
             ProcessingSupervisorMessage::Shutdown => {
                 info!("Shutting down processing supervisor");
 
-                // Drain factory requests
+                // Drain factory requests to prevent new jobs
                 state.factory
                     .send_message(FactoryMessage::DrainRequests)
                     .map_err(|e|
                         ActorProcessingErr::from(format!("Failed to drain factory: {:?}", e))
                     )?;
+                
+                info!("Factory requests drained");
+
+                // Give workers a moment to finish current work
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 // The factory will handle shutting down its workers
+                // Workers will unclaim their current repos in post_stop
                 myself.stop(Some("Shutdown requested".to_string()));
             }
         }
@@ -254,35 +323,4 @@ impl Actor for ProcessingSupervisor {
         );
         Ok(())
     }
-}
-
-/// Process existing accounts on startup
-async fn process_existing_accounts(
-    db_pool: Arc<SurrealPool>,
-    factory: ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>
-) -> Result<()> {
-    info!("Processing existing accounts");
-
-    // Get a connection from the pool
-    let db_conn = db_pool.get().await?;
-    
-    // Get up to 100 GitHub accounts
-    let accounts = db_conn.get_github_accounts(100).await?;
-
-    info!("Found {} existing GitHub accounts", accounts.len());
-
-    // Submit a job for each account - workers will handle the rest
-    for account in accounts {
-        if let Err(e) = submit_account_processing_job(
-            &factory,
-            &account.user_id,
-            account.access_token.clone()
-        ).await {
-            error!("Failed to submit job for existing user {}: {}", account.user_id.key(), e);
-        } else {
-            info!("Submitted account processing job for user {}", account.user_id.key());
-        }
-    }
-
-    Ok(())
 }

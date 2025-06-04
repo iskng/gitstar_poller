@@ -17,6 +17,36 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GitHubJobKey {
     pub user_id: RecordId,
+    pub is_new_account: bool, // true for live query accounts, false for existing accounts
+}
+
+// Job priority levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JobPriority {
+    Low = 0,
+    High = 1,
+}
+
+impl Default for JobPriority {
+    fn default() -> Self {
+        JobPriority::Low
+    }
+}
+
+impl From<usize> for JobPriority {
+    fn from(value: usize) -> Self {
+        match value {
+            0 => JobPriority::Low,
+            _ => JobPriority::High,
+        }
+    }
+}
+
+// Implement Priority trait for JobPriority
+impl ractor::factory::queues::Priority for JobPriority {
+    fn get_index(&self) -> usize {
+        *self as usize
+    }
 }
 
 // Job payload - the actual work to do
@@ -38,8 +68,12 @@ pub struct GitHubWorkerState {
     rate_limit_state: RateLimitState,
     last_activity: Instant,
     // Queue of repos to process for current account
-    repo_queue: Vec<(RecordId, String)>, // (repo_id, repo_full_name)
+    repo_queue: std::collections::VecDeque<(RecordId, String)>, // (repo_id, repo_full_name)
     current_account: Option<(RecordId, String)>, // (user_id, access_token)
+    // Currently claimed repo that needs to be unclaimed on shutdown/error
+    current_claimed_repo: Option<RecordId>,
+    // Flag to indicate shutdown is in progress
+    shutting_down: bool,
 }
 
 impl GitHubWorker {
@@ -67,8 +101,10 @@ impl Actor for GitHubWorker {
             jobs_processed: 0,
             rate_limit_state: RateLimitState::default(),
             last_activity: Instant::now(),
-            repo_queue: Vec::new(),
+            repo_queue: std::collections::VecDeque::new(),
             current_account: None,
+            current_claimed_repo: None,
+            shutting_down: false,
         })
     }
 
@@ -83,6 +119,15 @@ impl Actor for GitHubWorker {
                 // Factory ping received, no response needed
             }
             WorkerMessage::Dispatch(job) => {
+                // Check if we're shutting down
+                if state.shutting_down {
+                    info!(
+                        worker_id = ?state.worker_id,
+                        "Worker is shutting down, rejecting new job"
+                    );
+                    return Ok(());
+                }
+                
                 let job_key = job.key.clone();
                 let payload = job.msg;
 
@@ -117,6 +162,7 @@ impl Actor for GitHubWorker {
                 let result = self.process_account(
                     &job_key.user_id,
                     &payload.access_token,
+                    job_key.is_new_account,
                     state
                 ).await;
 
@@ -154,6 +200,33 @@ impl Actor for GitHubWorker {
         info!(
             worker_id = ?state.worker_id,
             jobs_processed = state.jobs_processed,
+            repos_in_queue = state.repo_queue.len(),
+            "GitHub worker stopping"
+        );
+        
+        // Set shutdown flag to stop processing
+        state.shutting_down = true;
+        
+        // Clear the repo queue to prevent further processing
+        state.repo_queue.clear();
+        
+        // Unclaim any repo that was being processed
+        if let Some(repo_id) = &state.current_claimed_repo {
+            info!("Unclaiming repo {} on worker shutdown", repo_id.key());
+            match state.db_pool.get().await {
+                Ok(db_conn) => {
+                    if let Err(e) = db_conn.unclaim_repo(repo_id).await {
+                        error!("Failed to unclaim repo {} on shutdown: {}", repo_id.key(), e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to get DB connection to unclaim repo: {}", e);
+                }
+            }
+        }
+        
+        info!(
+            worker_id = ?state.worker_id,
             "GitHub worker stopped"
         );
         Ok(())
@@ -180,6 +253,8 @@ impl GitHubWorker {
         match db_conn.claim_repo_for_processing(repo_id, user_id).await {
             Ok(true) => {
                 debug!("Successfully claimed repo {} for processing", repo_full_name);
+                // Track this repo as claimed so we can unclaim on error/shutdown
+                // Note: We can't modify state here since we don't have mutable access
             }
             Ok(false) => {
                 info!("Repo {} already being processed by another worker", repo_full_name);
@@ -207,8 +282,9 @@ impl GitHubWorker {
                     total_stargazers += stargazers_count;
 
                     info!(
-                        "Fetched page {} with {} stargazers for repo {}",
-                        page, stargazers_count, repo_full_name
+                        "Fetched page {} with {} stargazers for repo {} (rate limit: {}/{})",
+                        page, stargazers_count, repo_full_name, 
+                        rate_limit_state.remaining, rate_limit_state.limit
                     );
 
                     if !stargazers.is_empty() {
@@ -234,10 +310,25 @@ impl GitHubWorker {
 
                     page += 1;
 
-                    // Add small delay between pages to be respectful
-                    if rate_limit_state.remaining < 100 {
-                        sleep(Duration::from_millis(500)).await;
-                    }
+                    // Rate limiting to target 4000 requests/hour (1.11 req/sec)
+                    // This gives us a safety margin from GitHub's 5000/hour limit
+                    // Minimum delay of 900ms between requests ensures we stay under 4000/hour
+                    let base_delay_ms = 900;
+                    
+                    // Add extra delay if rate limit is getting low
+                    let delay_ms = if rate_limit_state.remaining < 100 {
+                        2000 // 2 seconds if very low
+                    } else if rate_limit_state.remaining < 500 {
+                        1500 // 1.5 seconds if low  
+                    } else if rate_limit_state.remaining < 1000 {
+                        1200 // 1.2 seconds if moderate
+                    } else {
+                        base_delay_ms // 900ms standard delay
+                    };
+                    
+                    debug!("Rate limit remaining: {}/{}, delaying {}ms", 
+                        rate_limit_state.remaining, rate_limit_state.limit, delay_ms);
+                    sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Err(GitHubStarsError::RateLimitExceeded(msg)) => {
                     warn!("Rate limit exceeded for repo {}: {}", repo_full_name, msg);
@@ -283,16 +374,26 @@ impl GitHubWorker {
         &self,
         user_id: &RecordId,
         access_token: &str,
+        is_new_account: bool,
         state: &mut GitHubWorkerState,
     ) -> Result<()> {
-        info!("Processing account for user {}", user_id.key());
+        info!("Processing {} account for user {}", 
+            if is_new_account { "new" } else { "existing" },
+            user_id.key()
+        );
 
         // Get a connection from the pool
         let db_conn = state.db_pool.get().await
             .map_err(|e| GitHubStarsError::ApiError(format!("Failed to get DB connection: {}", e)))?;
 
-        // Wait for repo sync to complete
-        self.wait_for_repo_sync(&state.db_pool, user_id).await?;
+        // Only wait for repo sync if this is a new account
+        // For existing accounts, repos are already synced
+        if is_new_account {
+            info!("Waiting for repo sync to complete for new account");
+            self.wait_for_repo_sync(&state.db_pool, user_id).await?;
+        } else {
+            info!("Skipping repo sync wait for existing account");
+        }
 
         // Get all repos for this user
         let mut repos = db_conn
@@ -336,7 +437,7 @@ impl GitHubWorker {
                 continue;
             }
 
-            state.repo_queue.push((repo.id.clone(), repo.full_name.clone()));
+            state.repo_queue.push_back((repo.id.clone(), repo.full_name.clone()));
             queued_count += 1;
         }
 
@@ -349,7 +450,13 @@ impl GitHubWorker {
         state.current_account = Some((user_id.clone(), access_token.to_string()));
 
         // Process all repos in the queue
-        while let Some((repo_id, repo_full_name)) = state.repo_queue.pop() {
+        while let Some((repo_id, repo_full_name)) = state.repo_queue.pop_front() {
+            // Check if we're shutting down
+            if state.shutting_down {
+                info!("Worker shutting down, stopping repo processing");
+                break;
+            }
+            
             info!("Processing repo {} ({} remaining in queue)", repo_full_name, state.repo_queue.len());
 
             // Check rate limit before each repo
@@ -365,20 +472,38 @@ impl GitHubWorker {
                         wait_duration.as_secs()
                     );
                     
-                    sleep(wait_duration).await;
-                    state.rate_limit_state.is_limited = false;
+                    // Check for shutdown during rate limit wait
+                    tokio::select! {
+                        _ = sleep(wait_duration) => {
+                            state.rate_limit_state.is_limited = false;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            if state.shutting_down {
+                                info!("Worker shutting down during rate limit wait");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
+            // Set current claimed repo before processing
+            state.current_claimed_repo = Some(repo_id.clone());
+            
             // Process the repository
-            if let Err(e) = self.process_repository(
+            let process_result = self.process_repository(
                 user_id,
                 &repo_id,
                 &repo_full_name,
                 access_token,
                 &state.db_pool,
                 &mut state.rate_limit_state
-            ).await {
+            ).await;
+            
+            // Clear current claimed repo after processing (success or failure)
+            state.current_claimed_repo = None;
+            
+            if let Err(e) = process_result {
                 error!("Failed to process repo {}: {:?}", repo_full_name, e);
                 // Continue with next repo even if one fails
             }
@@ -400,9 +525,9 @@ impl GitHubWorker {
     ) -> Result<()> {
         use tokio::time::{sleep, Duration, timeout};
 
-        const MAX_WAIT: Duration = Duration::from_secs(300); // 5 minutes max
-        const CHECK_INTERVAL: Duration = Duration::from_secs(2);
-        const REQUIRED_STABLE_CHECKS: u32 = 15; // 30 seconds of stability
+        const MAX_WAIT: Duration = Duration::from_secs(120); // 2 minutes max  
+        const CHECK_INTERVAL: Duration = Duration::from_secs(1);
+        const REQUIRED_STABLE_CHECKS: u32 = 5; // 5 seconds of stability
 
         info!("Waiting for repo sync to complete for user {}", user_id.key());
 
