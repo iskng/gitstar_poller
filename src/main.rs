@@ -15,14 +15,20 @@ use colored::*;
 use error::{ GitHubStarsError, Result };
 use pool::{ create_pool, PoolConfig, SurrealConnectionConfig };
 use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env file if it exists
     dotenv::dotenv().ok();
 
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing with WARN level by default
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("warn"))
+        )
+        .init();
 
     let mut cli = Cli::parse();
 

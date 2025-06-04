@@ -190,7 +190,7 @@ impl SurrealClient {
                 WHERE repo = $repo_id 
                 AND (
                     status = 'completed' 
-                    OR (status = 'processing' AND claimed_at > time::now() - 1h)
+                    OR (status = 'processing' AND claimed_at > (time::now() - duration::from::hours(1)))
                 )
             );
             
@@ -208,7 +208,7 @@ impl SurrealClient {
                     processed_stargazers = 0,
                     error_count = 0
                 WHERE repo = $repo_id 
-                AND (status != 'processing' OR claimed_at < time::now() - 1h OR status = NULL);
+                AND (status != 'processing' OR claimed_at < (time::now() - duration::from::hours(1)) OR status = NULL);
                 RETURN true;
             } ELSE {
                 RETURN false;
@@ -534,12 +534,11 @@ impl SurrealClient {
                 claimed_by = NULL,
                 claimed_at = NULL
             WHERE status = 'processing' 
-            AND claimed_at < time::now() - $timeout
+            AND claimed_at < (time::now() - duration::from::mins($timeout_mins))
             RETURN AFTER
         "#;
 
-        let timeout_duration = format!("{}m", timeout_minutes);
-        let mut result = self.db.query(query).bind(("timeout", timeout_duration)).await?;
+        let mut result = self.db.query(query).bind(("timeout_mins", timeout_minutes)).await?;
 
         let updated: Vec<RepoProcessingStatus> = result.take(0)?;
         let count = updated.len() as u32;

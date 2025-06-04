@@ -179,6 +179,9 @@ The server integrates with a Next.js application that:
 ### Monitoring and Debugging
 
 - **Logging**: Uses tracing for structured logging
+  - Default log level: WARN (only warnings and errors)
+  - Override with RUST_LOG environment variable (e.g., `RUST_LOG=info cargo run`)
+  - Common log levels: `error`, `warn`, `info`, `debug`, `trace`
 - **Statistics**: Get runtime stats via supervisor
 - **Health Checks**: Connection pool validates connections
 - **Graceful Shutdown**: Ctrl+C triggers clean shutdown with final stats
