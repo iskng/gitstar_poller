@@ -1,6 +1,6 @@
 use crate::actors::github_factory::{
     spawn_github_factory,
-    submit_repo_processing_job,
+    submit_account_processing_job,
     GitHubFactoryConfig,
 };
 use crate::actors::github_worker::{ GitHubJobKey, GitHubJobPayload };
@@ -16,9 +16,8 @@ use ractor::{
     factory::FactoryMessage,
 };
 use std::sync::Arc;
-use surrealdb::RecordId;
 use tokio::sync::mpsc;
-use tracing::{ debug, error, info, warn };
+use tracing::{ debug, error, info };
 
 /// The main supervisor that coordinates all processing
 pub struct ProcessingSupervisor;
@@ -180,33 +179,17 @@ impl Actor for ProcessingSupervisor {
                     event.user.name.as_deref().unwrap_or("Unknown")
                 );
 
-                // Wait for repo sync to stabilize before processing
-                let db_pool = state.db_pool.clone();
-                let factory = state.factory.clone();
-                let user_id = event.user.id.clone();
-                let access_token = event.account.access_token.clone();
-
-                tokio::spawn(async move {
-                    // Wait for repo sync to complete
-                    if let Err(e) = wait_for_repo_sync_completion(&db_pool, &user_id).await {
-                        error!("Failed to wait for repo sync for user {}: {}", user_id.key(), e);
-                        return;
-                    }
-
-                    // Process all repos for this account
-                    if
-                        let Err(e) = process_account_repos(
-                            &db_pool,
-                            &factory,
-                            &user_id,
-                            &access_token
-                        ).await
-                    {
-                        error!("Failed to process repos for user {}: {}", user_id.key(), e);
-                    }
-                });
-
-                state.total_accounts_processed += 1;
+                // Submit account processing job - worker will handle sync wait and repo processing
+                if let Err(e) = submit_account_processing_job(
+                    &state.factory,
+                    &event.user.id,
+                    event.account.access_token.clone()
+                ).await {
+                    error!("Failed to submit job for new user {}: {}", event.user.id.key(), e);
+                } else {
+                    info!("Submitted account processing job for new user {}", event.user.id.key());
+                    state.total_accounts_processed += 1;
+                }
             }
 
             ProcessingSupervisorMessage::GetStats(reply) => {
@@ -273,158 +256,6 @@ impl Actor for ProcessingSupervisor {
     }
 }
 
-/// Process all repos for a given account
-async fn process_account_repos(
-    db_pool: &Arc<SurrealPool>,
-    factory: &ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>,
-    user_id: &RecordId,
-    access_token: &str
-) -> Result<()> {
-    // Get a connection from the pool
-    let db_conn = db_pool.get().await
-        .map_err(|e| anyhow::anyhow!("Failed to get connection from pool: {}", e))?;
-
-    // Get all starred repos for this user
-    let mut repos = db_conn
-        .get_repos_for_processing(user_id).await
-        .map_err(|e| anyhow::anyhow!("Failed to get repos: {}", e))?;
-
-    info!("Found {} starred repos for user {}", repos.len(), user_id.key());
-
-    if repos.is_empty() {
-        return Ok(());
-    }
-    
-    // Sort repos by star count (lowest first) for faster initial processing
-    repos.sort_by_key(|r| r.stars);
-    debug!("Sorted repos by star count - smallest repo: {} stars, largest: {} stars", 
-        repos.first().map(|r| r.stars).unwrap_or(0),
-        repos.last().map(|r| r.stars).unwrap_or(0));
-
-    // Get processing status for all repos to filter on client side
-    let repo_ids: Vec<String> = repos
-        .iter()
-        .map(|r| r.full_name.clone())
-        .collect();
-
-    let statuses = db_conn
-        .get_repos_processing_status(&repo_ids).await
-        .map_err(|e| anyhow::anyhow!("Failed to get processing statuses: {}", e))?;
-
-    // Create a set of repos that are already processed or being processed
-    let processed_repos: std::collections::HashSet<String> = statuses
-        .into_iter()
-        .filter(|s|
-            matches!(
-                s.status,
-                crate::models::ProcessingStatus::Completed |
-                    crate::models::ProcessingStatus::Processing
-            )
-        )
-        .map(|s| s.repo.key().to_string())
-        .collect();
-
-    let mut submitted_count = 0;
-    let mut skipped_count = 0;
-
-    // Submit jobs for repos that aren't already processed
-    for repo in repos {
-        // Skip if already processed or being processed
-        if processed_repos.contains(&repo.full_name) {
-            debug!("Skipping already processed repo: {}", repo.full_name);
-            skipped_count += 1;
-            continue;
-        }
-
-        // Don't claim here - let the worker claim when it starts processing
-        // Just submit the job to the factory
-        if
-            let Err(e) = submit_repo_processing_job(
-                factory,
-                user_id,
-                &repo.id,
-                repo.full_name.clone(),
-                access_token.to_string()
-            ).await
-        {
-            error!("Failed to submit job for repo {}: {}", repo.full_name, e);
-        } else {
-            debug!("Submitted job for repo {}", repo.full_name);
-            submitted_count += 1;
-        }
-    }
-
-    info!(
-        "Processed repos for user {}: {} submitted, {} skipped",
-        user_id.key(),
-        submitted_count,
-        skipped_count
-    );
-
-    Ok(())
-}
-
-/// Wait for repo sync to complete by monitoring repo count stability
-async fn wait_for_repo_sync_completion(
-    db_pool: &Arc<SurrealPool>,
-    user_id: &RecordId
-) -> Result<()> {
-    use tokio::time::{ sleep, Duration };
-
-    info!("Waiting for repo sync to complete for user {}", user_id.key());
-
-    let mut last_count = 0;
-    let mut stable_checks = 0;
-    const REQUIRED_STABLE_CHECKS: u32 = 2; // Number of consecutive checks with same count
-    const CHECK_INTERVAL: Duration = Duration::from_secs(1);
-    const MAX_WAIT_TIME: Duration = Duration::from_secs(10); // 10 seconds max wait
-
-    let start_time = tokio::time::Instant::now();
-
-    loop {
-        // Check if we've exceeded max wait time
-        if start_time.elapsed() > MAX_WAIT_TIME {
-            warn!("Repo sync timeout for user {} - proceeding anyway", user_id.key());
-            break;
-        }
-
-        // Get a connection from the pool
-        let db_conn = db_pool.get().await?;
-        
-        // Get current repo count
-        let repos = db_conn.get_repos_for_processing(user_id).await?;
-        let current_count = repos.len();
-
-        debug!("User {} currently has {} starred repos", user_id.key(), current_count);
-
-        // Check if count has stabilized
-        if current_count == last_count && current_count > 0 {
-            stable_checks += 1;
-            if stable_checks >= REQUIRED_STABLE_CHECKS {
-                info!(
-                    "Repo sync stabilized for user {} with {} repos",
-                    user_id.key(),
-                    current_count
-                );
-                break;
-            }
-        } else {
-            // Reset stability counter if count changed
-            stable_checks = 0;
-            last_count = current_count;
-        }
-
-        // If we have no repos yet, log it
-        if current_count == 0 {
-            debug!("No repos yet for user {}, waiting...", user_id.key());
-        }
-
-        sleep(CHECK_INTERVAL).await;
-    }
-
-    Ok(())
-}
-
 /// Process existing accounts on startup
 async fn process_existing_accounts(
     db_pool: Arc<SurrealPool>,
@@ -440,22 +271,16 @@ async fn process_existing_accounts(
 
     info!("Found {} existing GitHub accounts", accounts.len());
 
+    // Submit a job for each account - workers will handle the rest
     for account in accounts {
-        // Wait for any ongoing repo sync to complete
-        if let Err(e) = wait_for_repo_sync_completion(&db_pool, &account.user_id).await {
-            error!("Failed to wait for repo sync for user {}: {}", account.user_id.key(), e);
-            continue;
-        }
-
-        if
-            let Err(e) = process_account_repos(
-                &db_pool,
-                &factory,
-                &account.user_id,
-                &account.access_token
-            ).await
-        {
-            error!("Failed to process repos for existing user {}: {}", account.user_id.key(), e);
+        if let Err(e) = submit_account_processing_job(
+            &factory,
+            &account.user_id,
+            account.access_token.clone()
+        ).await {
+            error!("Failed to submit job for existing user {}: {}", account.user_id.key(), e);
+        } else {
+            info!("Submitted account processing job for user {}", account.user_id.key());
         }
     }
 

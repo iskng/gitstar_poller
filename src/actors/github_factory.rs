@@ -1,10 +1,18 @@
 use anyhow::Result;
 use ractor::{
-    Actor, ActorRef,
-    factory::{Factory, FactoryArguments, FactoryMessage, queues, routing, discard::DiscardHandler},
+    Actor,
+    ActorRef,
+    factory::{
+        Factory,
+        FactoryArguments,
+        FactoryMessage,
+        queues,
+        routing,
+        discard::DiscardHandler,
+    },
 };
 use std::sync::Arc;
-use tracing::{info, error, warn};
+use tracing::{ info, error, warn };
 
 use crate::actors::github_worker::{
     GitHubWorker,
@@ -30,7 +38,7 @@ impl Default for GitHubFactoryConfig {
         Self {
             num_initial_workers: 5,
             queue_capacity: 1000,
-            dead_mans_switch_timeout_seconds: 300, // 5 minutes
+            dead_mans_switch_timeout_seconds: 100000, // 5 minutes
         }
     }
 }
@@ -43,13 +51,10 @@ impl DiscardHandler<GitHubJobKey, GitHubJobPayload> for GitHubJobDiscardHandler 
     fn discard(
         &self,
         reason: ractor::factory::discard::DiscardReason,
-        job: &mut ractor::factory::Job<GitHubJobKey, GitHubJobPayload>,
+        job: &mut ractor::factory::Job<GitHubJobKey, GitHubJobPayload>
     ) {
-        warn!(
-            "Discarding job {:?} for reason: {:?}",
-            job.key, reason
-        );
-        
+        warn!("Discarding job {:?} for reason: {:?}", job.key, reason);
+
         // In a production system, you might want to:
         // - Log to metrics
         // - Send to a dead letter queue
@@ -71,21 +76,18 @@ pub type GitHubProcessingFactory = Factory<
 /// Spawns a GitHub processing factory
 pub async fn spawn_github_factory(
     config: GitHubFactoryConfig,
-    db_pool: Arc<SurrealPool>,
+    db_pool: Arc<SurrealPool>
 ) -> Result<ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>> {
-    info!(
-        "Spawning GitHub processing factory with {} initial workers",
-        config.num_initial_workers
-    );
+    info!("Spawning GitHub processing factory with {} initial workers", config.num_initial_workers);
 
     // Create queue
     let queue = queues::DefaultQueue::<GitHubJobKey, GitHubJobPayload>::default();
     // Note: DefaultQueue in current ractor version doesn't support set_capacity
     // Using default capacity for now
-    
+
     // Use sticky routing so same user's repos go to same worker
     let router = routing::StickyQueuerRouting::<GitHubJobKey, GitHubJobPayload>::default();
-    
+
     // Create worker builder
     let worker_builder = GitHubWorkerBuilder::new(db_pool);
 
@@ -121,33 +123,29 @@ pub async fn spawn_github_factory(
     }
 }
 
-/// Helper to submit a job to the factory
-pub async fn submit_repo_processing_job(
+/// Helper to submit an account processing job to the factory
+pub async fn submit_account_processing_job(
     factory: &ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>,
     user_id: &surrealdb::RecordId,
-    repo_id: &surrealdb::RecordId,
-    repo_full_name: String,
-    access_token: String,
+    access_token: String
 ) -> Result<()> {
-    let job_key = GitHubJobKey { 
-        user_id: user_id.clone(), 
-        repo_id: repo_id.clone() 
+    let job_key = GitHubJobKey {
+        user_id: user_id.clone(),
     };
-    let payload = GitHubJobPayload::ProcessRepo {
-        repo_full_name,
+    let payload = GitHubJobPayload {
         access_token,
     };
-    
+
     let job = ractor::factory::Job {
         key: job_key,
         msg: payload,
         options: Default::default(),
         accepted: None,
     };
-    
+
     factory
         .send_message(FactoryMessage::Dispatch(job))
-        .map_err(|e| anyhow::anyhow!("Failed to dispatch job: {:?}", e))?;
-    
+        .map_err(|e| anyhow::anyhow!("Failed to dispatch account job: {:?}", e))?;
+
     Ok(())
 }

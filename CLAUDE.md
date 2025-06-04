@@ -4,110 +4,192 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Development Commands
 
-- `cargo run -- --help` - Show CLI help and available commands
-- `cargo run -- user <username>` - Analyze a GitHub user's starred repositories
-- `cargo run -- repos <url1,url2>` - Analyze specific repositories
-- `cargo run -- server` - Run as a background server processing GitHub stars
-- `cargo build` - Build the application
+- `cargo run` - Run the server with default settings
+- `cargo run -- --local` - Run in local development mode (automatically uses ws://localhost:8000)
+- `cargo run -- --help` - Show all available CLI options
+- `cargo build` - Build the application in debug mode
 - `cargo build --release` - Build optimized release version
-- `cargo test` - Run tests
+- `cargo test` - Run all tests
 - `cargo check` - Check code without building
-- `cargo clippy` - Run Rust linter
-- `cargo fmt` - Format code
+- `cargo clippy` - Run Rust linter for code quality
+- `cargo fmt` - Format code according to Rust standards
 
 ## Architecture Overview
 
-This is a hybrid CLI tool and server that analyzes GitHub repository stargazers. It can run in two modes:
-1. **CLI Mode**: One-time analysis of repositories or users
-2. **Server Mode**: Background service that processes GitHub stars using actor-based concurrency
+This is a GitHub Stars Processing Server that analyzes repository stargazers in the background using actor-based concurrency with SurrealDB for persistence.
 
 ### Project Structure
-- `src/main.rs` - Entry point and main application logic
+
+- `src/main.rs` - Entry point and server initialization
 - `src/cli.rs` - Command line argument parsing with clap
 - `src/github.rs` - GitHub API client with rate limiting and pagination
-- `src/types.rs` - Data structures and type definitions (for CLI mode)
-- `src/models.rs` - Data models for server mode and SurrealDB integration
+- `src/models.rs` - Data models for SurrealDB integration
 - `src/surreal_client.rs` - SurrealDB client with live query support
-- `src/actors/` - Actor system components
-  - `token_actor.rs` - Processes repos for a single GitHub token
-  - `token_supervisor.rs` - Manages token actors and live queries
-- `src/display.rs` - Result formatting and display logic
-- `src/json_output.rs` - JSON export functionality
-- `src/interactive.rs` - Interactive menu system
+- `src/pool.rs` - Deadpool connection pool implementation for SurrealDB
 - `src/error.rs` - Error handling and custom error types
+- `src/actors/` - Actor system components using ractor
+  - `processing_supervisor.rs` - Top-level supervisor managing the entire system
+  - `github_factory.rs` - Factory for creating and managing GitHub workers
+  - `github_worker.rs` - Worker actors that process repository stargazers
+- `src/types.rs` - Type definitions (legacy from CLI mode)
 
 ### Key Features
-- **GitHub API Integration**: Fetches stargazers and starred repositories with automatic rate limiting
-- **User Analysis**: Finds users who have starred similar repositories
-- **Multiple Sorting Options**: Stars, username, repository count, common interests
-- **JSON Export**: Save analysis results to JSON files
-- **Interactive Mode**: Menu-driven interface for sorting options
-- **Rate Limit Handling**: Automatic retries and delays for API limits
+
+- **Actor-Based Concurrency**: Uses ractor for scalable, fault-tolerant processing
+- **Connection Pooling**: Implements deadpool for efficient database connection management
+- **GitHub API Integration**: Fetches stargazers with automatic rate limiting
+- **Live Queries**: Reacts to new GitHub accounts in real-time via SurrealDB
+- **Automatic Retry**: Handles rate limits and failures gracefully
+- **Sticky Routing**: Ensures same user's repos go to same worker for optimal token usage
+
+### Database Connection Pooling
+
+The server uses deadpool to manage SurrealDB connections efficiently:
+
+- **Pool Configuration**:
+  - `--db-pool-max-size` (default: 10) - Maximum connections in the pool
+  - `--db-pool-min-idle` (default: 2) - Minimum idle connections to maintain
+  - `--db-connection-timeout` (default: 30s) - Timeout for acquiring connections
+
+- **Architecture**:
+  - Pool created at supervisor level and shared via `Arc<SurrealPool>`
+  - Workers get connections per job (not per worker lifetime)
+  - Connections automatically returned to pool when dropped
+  - Health checks ensure connection validity
 
 ### Environment Setup
 
-1. Create a `.env` file from `.env.example`
-2. Configure based on your usage:
+1. Create a `.env` file with the following variables:
 
-#### For CLI Mode:
-- `GITHUB_TOKEN`: Your GitHub personal access token (required)
-- No special scopes required for public repository access
+```env
+# SurrealDB Configuration
+DB_URL=ws://localhost:8000
+DB_USER=root
+DB_PASS=root
+DB_NAMESPACE=gitstars  # Must match Next.js app
+DB_DATABASE=stars       # Must match Next.js app
 
-#### For Server Mode:
-- `DB_URL`: SurrealDB WebSocket URL (default: ws://localhost:8000)
-- `DB_USER`: Database username (default: root)
-- `DB_PASS`: Database password (default: root)
-- `DB_NAMESPACE`: Must be "gitstars" to match Next.js app
-- `DB_DATABASE`: Must be "stars" to match Next.js app
-
-The application automatically loads `.env` on startup. You can also override any setting via command-line arguments.
-
-### Usage Examples
-```bash
-# Analyze a user's starred repositories
-cargo run -- user octocat --limit 50
-
-# Analyze specific repositories
-cargo run -- repos "https://github.com/rust-lang/rust,https://github.com/microsoft/vscode"
-
-# Sort by common stars and export to JSON
-cargo run -- user octocat --sort common-stars --output results.json
-
-# Interactive mode
-cargo run -- user octocat --interactive
-
-# Run as a server (processes GitHub stars in background)
-cargo run -- server --db-url ws://localhost:8000 --db-user root --db-pass root
+# Connection Pool Settings (optional)
+DB_POOL_MAX_SIZE=10
+DB_POOL_MIN_IDLE=2
+DB_CONNECTION_TIMEOUT=30
 ```
 
-### CLI Commands
-- `user <username>` - Analyze user's starred repositories
-  - `--limit <n>` - Limit number of repositories to analyze
-- `repos <urls>` - Analyze comma-separated repository URLs
-- `server` - Run as a background server
-  - `--db-url <url>` - SurrealDB connection URL
-  - `--db-user <user>` - SurrealDB username
-  - `--db-pass <pass>` - SurrealDB password
-  - `--db-namespace <ns>` - SurrealDB namespace
-  - `--db-database <db>` - SurrealDB database
-- Global options:
-  - `--sort <option>` - Sort results (stars-desc, stars-asc, username, user-repos, common-stars)
-  - `--output <file>` - Export results to JSON file
-  - `--max-stars <n>` - Skip repositories with more than N stars (default: 50000)
-  - `--no-filter` - Include all repositories regardless of star count
-  - `--interactive` - Show interactive sorting menu
+2. Start SurrealDB (if not already running):
+```bash
+surreal start --bind 0.0.0.0:8000 --user root --pass root --log info memory --allow-all
+```
 
-### Server Mode Architecture
+### Usage Examples
 
-When running in server mode, the application:
-1. Connects to SurrealDB and listens for new GitHub accounts via live queries
-2. Spawns a TokenActor for each user with a GitHub access token
-3. Each TokenActor:
-   - Manages its own GitHub API client and rate limits
-   - Processes repos the user has starred (already synced by Next.js)
-   - Fetches all stargazers for those repos
-   - Creates github_user records and stargazer relationships
-   - Handles rate limiting with automatic backoff and retry
-4. TokenSupervisor manages all TokenActors and provides statistics
+```bash
+# Run with default settings (reads from .env)
+cargo run
 
-The server integrates seamlessly with the Next.js frontend that handles initial user authentication and starred repo synchronization.
+# Run in local development mode
+cargo run -- --local
+
+# Run with custom database settings
+cargo run -- --db-url ws://localhost:8000 --db-user root --db-pass root
+
+# Run with custom pool configuration
+cargo run -- --db-pool-max-size 20 --db-pool-min-idle 5
+
+# Show all available options
+cargo run -- --help
+```
+
+### CLI Options
+
+- `--local` - Use local development settings (DB URL: ws://localhost:8000)
+- `--db-url <URL>` - SurrealDB connection URL (default: ws://localhost:8000)
+- `--db-user <USER>` - Database username (default: root)
+- `--db-pass <PASS>` - Database password (default: root)
+- `--db-namespace <NS>` - Database namespace (default: gitstars)
+- `--db-database <DB>` - Database name (default: stars)
+- `--db-pool-max-size <N>` - Maximum pool connections (default: 10)
+- `--db-pool-min-idle <N>` - Minimum idle connections (default: 2)
+- `--db-connection-timeout <SECS>` - Connection timeout in seconds (default: 30)
+
+### Server Architecture
+
+1. **ProcessingSupervisor** (Top Level):
+   - Creates and manages the connection pool
+   - Sets up live queries for new GitHub accounts
+   - Spawns and manages the GitHubFactory
+   - Handles graceful shutdown
+   - Provides system-wide statistics
+
+2. **GitHubFactory** (Factory Pattern):
+   - Manages a pool of GitHubWorker actors
+   - Routes jobs using sticky routing (same user → same worker)
+   - Implements dead man's switch for stuck workers
+   - Handles job queue management
+
+3. **GitHubWorker** (Workers):
+   - Processes individual repository stargazer fetching jobs
+   - Gets database connections from pool per job
+   - Handles GitHub API rate limiting
+   - Claims repos atomically to prevent duplicate work
+   - Inserts stargazers in batches for efficiency
+
+### Workflow
+
+1. **Startup**:
+   - Creates connection pool with configured size
+   - Connects to SurrealDB and sets up live query
+   - Spawns supervisor → factory → workers
+   - Processes any existing accounts
+
+2. **New Account Detection**:
+   - Live query detects new GitHub account
+   - Waits for repo sync to stabilize
+   - Submits jobs for each starred repo
+   - Jobs routed to workers via sticky routing
+
+3. **Repository Processing**:
+   - Worker claims repo (atomic operation)
+   - Fetches stargazers page by page
+   - Inserts github_users and relationships in batches
+   - Updates progress after each page
+   - Marks repo complete or failed
+
+4. **Error Handling**:
+   - Rate limits: Worker waits until reset time
+   - API errors: Repo marked as failed
+   - Connection errors: Automatic retry from pool
+   - Worker crashes: Dead man's switch restarts
+
+### Integration with Next.js Frontend
+
+The server integrates with a Next.js application that:
+1. Handles user authentication with GitHub
+2. Syncs user's starred repositories
+3. Creates account and repo records in SurrealDB
+4. The server detects these via live queries and processes stargazers
+
+### Performance Considerations
+
+- **Connection Pool**: Scales database operations with worker count
+- **Batch Operations**: Reduces database round trips
+- **Sticky Routing**: Optimizes GitHub API token usage
+- **Rate Limit Handling**: Prevents API quota exhaustion
+- **Concurrent Processing**: Multiple workers process different repos in parallel
+
+### Monitoring and Debugging
+
+- **Logging**: Uses tracing for structured logging
+- **Statistics**: Get runtime stats via supervisor
+- **Health Checks**: Connection pool validates connections
+- **Graceful Shutdown**: Ctrl+C triggers clean shutdown with final stats
+
+### Dependencies
+
+Key dependencies include:
+- `ractor` - Actor framework for concurrent processing
+- `deadpool` - Connection pooling with Tokio runtime support
+- `surrealdb` - Database client with WebSocket support
+- `tokio` - Async runtime
+- `reqwest` - HTTP client for GitHub API
+- `clap` - Command line parsing
+- `tracing` - Structured logging

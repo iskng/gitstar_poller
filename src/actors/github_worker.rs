@@ -13,20 +13,16 @@ use surrealdb::RecordId;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-// Job key - identifies unique work items
+// Job key - identifies unique work items (by user)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GitHubJobKey {
     pub user_id: RecordId,
-    pub repo_id: RecordId,
 }
 
 // Job payload - the actual work to do
 #[derive(Debug, Clone)]
-pub enum GitHubJobPayload {
-    ProcessRepo {
-        repo_full_name: String,
-        access_token: String,
-    },
+pub struct GitHubJobPayload {
+    pub access_token: String,
 }
 
 /// Worker that processes GitHub repository stargazers
@@ -41,6 +37,9 @@ pub struct GitHubWorkerState {
     jobs_processed: u64,
     rate_limit_state: RateLimitState,
     last_activity: Instant,
+    // Queue of repos to process for current account
+    repo_queue: Vec<(RecordId, String)>, // (repo_id, repo_full_name)
+    current_account: Option<(RecordId, String)>, // (user_id, access_token)
 }
 
 impl GitHubWorker {
@@ -68,6 +67,8 @@ impl Actor for GitHubWorker {
             jobs_processed: 0,
             rate_limit_state: RateLimitState::default(),
             last_activity: Instant::now(),
+            repo_queue: Vec::new(),
+            current_account: None,
         })
     }
 
@@ -113,18 +114,11 @@ impl Actor for GitHubWorker {
                 }
 
                 // Process the job
-                let result = match payload {
-                    GitHubJobPayload::ProcessRepo { repo_full_name, access_token } => {
-                        self.process_repository(
-                            &job_key.user_id,
-                            &job_key.repo_id,
-                            &repo_full_name,
-                            &access_token,
-                            &state.db_pool,
-                            &mut state.rate_limit_state
-                        ).await
-                    }
-                };
+                let result = self.process_account(
+                    &job_key.user_id,
+                    &payload.access_token,
+                    state
+                ).await;
 
                 state.jobs_processed += 1;
 
@@ -283,6 +277,184 @@ impl GitHubWorker {
         );
 
         Ok(())
+    }
+
+    async fn process_account(
+        &self,
+        user_id: &RecordId,
+        access_token: &str,
+        state: &mut GitHubWorkerState,
+    ) -> Result<()> {
+        info!("Processing account for user {}", user_id.key());
+
+        // Get a connection from the pool
+        let db_conn = state.db_pool.get().await
+            .map_err(|e| GitHubStarsError::ApiError(format!("Failed to get DB connection: {}", e)))?;
+
+        // Wait for repo sync to complete
+        self.wait_for_repo_sync(&state.db_pool, user_id).await?;
+
+        // Get all repos for this user
+        let mut repos = db_conn
+            .get_repos_for_processing(user_id).await
+            .map_err(|e| GitHubStarsError::ApiError(format!("Failed to get repos: {}", e)))?;
+
+        if repos.is_empty() {
+            info!("No repos found for user {}", user_id.key());
+            return Ok(());
+        }
+
+        // Sort repos by star count (lowest first) for faster initial processing
+        repos.sort_by_key(|r| r.stars);
+        info!("Found {} repos for user {}, processing from smallest to largest", repos.len(), user_id.key());
+
+        // Get processing status for all repos
+        let repo_ids: Vec<String> = repos.iter().map(|r| r.full_name.clone()).collect();
+        let statuses = db_conn
+            .get_repos_processing_status(&repo_ids).await
+            .map_err(|e| GitHubStarsError::ApiError(format!("Failed to get processing statuses: {}", e)))?;
+
+        // Create a set of repos that are already processed or being processed
+        let processed_repos: std::collections::HashSet<String> = statuses
+            .into_iter()
+            .filter(|s| matches!(
+                s.status,
+                crate::models::ProcessingStatus::Completed | crate::models::ProcessingStatus::Processing
+            ))
+            .map(|s| s.repo.key().to_string())
+            .collect();
+
+        // Build queue of repos to process
+        state.repo_queue.clear();
+        let mut queued_count = 0;
+        let mut skipped_count = 0;
+
+        for repo in repos {
+            if processed_repos.contains(&repo.full_name) {
+                debug!("Skipping already processed repo: {}", repo.full_name);
+                skipped_count += 1;
+                continue;
+            }
+
+            state.repo_queue.push((repo.id.clone(), repo.full_name.clone()));
+            queued_count += 1;
+        }
+
+        info!(
+            "Queued {} repos for user {} ({} skipped as already processed)",
+            queued_count, user_id.key(), skipped_count
+        );
+
+        // Store account info for processing
+        state.current_account = Some((user_id.clone(), access_token.to_string()));
+
+        // Process all repos in the queue
+        while let Some((repo_id, repo_full_name)) = state.repo_queue.pop() {
+            info!("Processing repo {} ({} remaining in queue)", repo_full_name, state.repo_queue.len());
+
+            // Check rate limit before each repo
+            if state.rate_limit_state.is_limited {
+                let now = Utc::now();
+                if now < state.rate_limit_state.reset_time {
+                    let wait_duration = (state.rate_limit_state.reset_time - now)
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(60));
+                    
+                    warn!(
+                        "Rate limited, waiting {} seconds until reset",
+                        wait_duration.as_secs()
+                    );
+                    
+                    sleep(wait_duration).await;
+                    state.rate_limit_state.is_limited = false;
+                }
+            }
+
+            // Process the repository
+            if let Err(e) = self.process_repository(
+                user_id,
+                &repo_id,
+                &repo_full_name,
+                access_token,
+                &state.db_pool,
+                &mut state.rate_limit_state
+            ).await {
+                error!("Failed to process repo {}: {:?}", repo_full_name, e);
+                // Continue with next repo even if one fails
+            }
+
+            state.last_activity = Instant::now();
+        }
+
+        // Clear account info when done
+        state.current_account = None;
+        
+        info!("Completed processing all repos for user {}", user_id.key());
+        Ok(())
+    }
+
+    async fn wait_for_repo_sync(
+        &self,
+        db_pool: &Arc<SurrealPool>,
+        user_id: &RecordId,
+    ) -> Result<()> {
+        use tokio::time::{sleep, Duration, timeout};
+
+        const MAX_WAIT: Duration = Duration::from_secs(300); // 5 minutes max
+        const CHECK_INTERVAL: Duration = Duration::from_secs(2);
+        const REQUIRED_STABLE_CHECKS: u32 = 15; // 30 seconds of stability
+
+        info!("Waiting for repo sync to complete for user {}", user_id.key());
+
+        let wait_result = timeout(MAX_WAIT, async {
+            let mut last_count = 0;
+            let mut stable_checks = 0;
+
+            loop {
+                // Get a connection from the pool
+                let db_conn = db_pool.get().await
+                    .map_err(|e| GitHubStarsError::ApiError(format!("Failed to get DB connection: {}", e)))?;
+
+                // Get current repo count
+                let repos = db_conn
+                    .get_repos_for_processing(user_id).await
+                    .map_err(|e| GitHubStarsError::ApiError(format!("Failed to get repos: {}", e)))?;
+                let current_count = repos.len();
+
+                debug!(
+                    "User {} has {} repos (last count: {}, stable checks: {})",
+                    user_id.key(), current_count, last_count, stable_checks
+                );
+
+                // Check if count is stable
+                if current_count == last_count && current_count > 0 {
+                    stable_checks += 1;
+                    if stable_checks >= REQUIRED_STABLE_CHECKS {
+                        info!(
+                            "Repo sync appears complete for user {} with {} repos",
+                            user_id.key(), current_count
+                        );
+                        break;
+                    }
+                } else {
+                    stable_checks = 0;
+                    last_count = current_count;
+                }
+
+                sleep(CHECK_INTERVAL).await;
+            }
+
+            Ok::<(), GitHubStarsError>(())
+        }).await;
+
+        match wait_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                warn!("Timeout waiting for repo sync for user {}, proceeding anyway", user_id.key());
+                Ok(())
+            }
+        }
     }
 }
 
