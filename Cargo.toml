@@ -33,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 surrealdb = { version = "2.3", features = ["protocol-ws", "protocol-http"] }
 futures = "0.3"
 deadpool = { version = "0.12.2", features = ["rt_tokio_1"] }
+sysinfo = "0.35.2"
 
 [dev-dependencies]
 tokio-test = "0.4"

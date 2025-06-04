@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
     // Configure the factory
     let factory_config = GitHubFactoryConfig {
         num_initial_workers: num_workers,
+        max_workers: 1000,
         queue_capacity: 1000,
         dead_mans_switch_timeout_seconds: 10000, // 10000 seconds = 2 hours 46 minutes 40 seconds
     };
@@ -118,7 +119,8 @@ async fn main() -> Result<()> {
                             println!("\n📊 Final Statistics:");
                             println!("Total accounts processed: {}", stats.total_accounts_processed);
                             println!("Factory queue depth: {}", stats.factory_queue_depth);
-                            println!("Active workers: {}", stats.factory_active_workers);
+                            println!("Active workers: {} / {} total", stats.factory_active_workers, stats.current_worker_count);
+                            println!("System resources - CPU: {:.1}%, Memory: {:.1}%", stats.cpu_usage, stats.memory_usage_percent);
                         }
                         ractor::rpc::CallResult::Timeout => {
                             eprintln!("Timeout getting final statistics");

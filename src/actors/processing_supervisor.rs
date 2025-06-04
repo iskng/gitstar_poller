@@ -16,17 +16,66 @@ use ractor::{
     factory::FactoryMessage,
 };
 use std::sync::Arc;
+use sysinfo::System;
 use tokio::sync::mpsc;
-use tracing::{ debug, error, info };
+use tracing::{ debug, error, info, warn };
 
 /// The main supervisor that coordinates all processing
 pub struct ProcessingSupervisor;
+
+impl ProcessingSupervisor {
+    /// Check if system has enough resources to add more workers
+    fn can_add_workers(system: &mut System) -> (bool, String) {
+        // Refresh system info
+        system.refresh_memory();
+        system.refresh_cpu_usage();
+        
+        // Calculate average CPU usage across all CPUs
+        let cpu_count = system.cpus().len() as f32;
+        let total_cpu_usage: f32 = system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum();
+        let avg_cpu_usage = if cpu_count > 0.0 { total_cpu_usage / cpu_count } else { 0.0 };
+        
+        // Get memory usage
+        let total_memory = system.total_memory();
+        let used_memory = system.used_memory();
+        let memory_usage_percent = if total_memory > 0 {
+            (used_memory as f64 / total_memory as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        // Define thresholds
+        const MAX_CPU_PERCENT: f32 = 80.0;
+        const MAX_MEMORY_PERCENT: f64 = 85.0;
+        
+        let cpu_ok = avg_cpu_usage < MAX_CPU_PERCENT;
+        let memory_ok = memory_usage_percent < MAX_MEMORY_PERCENT;
+        
+        let status = format!(
+            "CPU: {:.1}% (limit: {}%), Memory: {:.1}% (limit: {}%)",
+            avg_cpu_usage, MAX_CPU_PERCENT, memory_usage_percent, MAX_MEMORY_PERCENT
+        );
+        
+        if !cpu_ok {
+            return (false, format!("CPU usage too high: {}", status));
+        }
+        
+        if !memory_ok {
+            return (false, format!("Memory usage too high: {}", status));
+        }
+        
+        (true, status)
+    }
+}
 
 /// State for the processing supervisor
 pub struct ProcessingSupervisorState {
     db_pool: Arc<SurrealPool>,
     factory: ActorRef<FactoryMessage<GitHubJobKey, GitHubJobPayload>>,
+    factory_config: GitHubFactoryConfig,
     total_accounts_processed: u64,
+    current_worker_count: usize,
+    system: System,
 }
 
 /// Messages the supervisor can handle
@@ -36,6 +85,10 @@ pub enum ProcessingSupervisorMessage {
     NewAccount(NewAccountEvent),
     /// Start processing existing accounts
     ProcessExisting,
+    /// Check and adjust worker scaling
+    CheckWorkerScaling,
+    /// Refresh CPU statistics
+    RefreshCpuStats,
     /// Get statistics about processing
     GetStats(RpcReplyPort<ProcessingStats>),
     /// Shutdown the system
@@ -47,6 +100,9 @@ pub struct ProcessingStats {
     pub total_accounts_processed: u64,
     pub factory_queue_depth: usize,
     pub factory_active_workers: usize,
+    pub current_worker_count: usize,
+    pub cpu_usage: f32,
+    pub memory_usage_percent: f64,
 }
 
 /// Arguments for starting the supervisor
@@ -96,6 +152,10 @@ impl Actor for ProcessingSupervisor {
         args: Self::Arguments
     ) -> Result<Self::State, ActorProcessingErr> {
         info!("Starting processing supervisor");
+        
+        // Save values we need before moving factory_config
+        let initial_worker_count = args.factory_config.num_initial_workers;
+        let factory_config = args.factory_config.clone();
 
         // Spawn the GitHub processing factory
         let factory = spawn_github_factory(
@@ -160,10 +220,50 @@ impl Actor for ProcessingSupervisor {
             }
         });
 
+        // Spawn periodic worker scaling task
+        let myself_for_scaling = myself.clone();
+        tokio::spawn(async move {
+            let mut scaling_interval = tokio::time::interval(tokio::time::Duration::from_secs(30)); // Every 30 seconds
+            scaling_interval.tick().await; // Skip first immediate tick
+
+            loop {
+                scaling_interval.tick().await;
+                // Send message to check and scale workers
+                if let Err(e) = myself_for_scaling.send_message(ProcessingSupervisorMessage::CheckWorkerScaling) {
+                    error!("Failed to send worker scaling check: {}", e);
+                    break;
+                }
+            }
+        });
+
+        // Spawn periodic CPU refresh task for accurate readings
+        let myself_for_cpu = myself.clone();
+        tokio::spawn(async move {
+            let mut cpu_interval = tokio::time::interval(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+            cpu_interval.tick().await; // Skip first immediate tick
+
+            loop {
+                cpu_interval.tick().await;
+                // Send message to refresh CPU stats
+                if let Err(e) = myself_for_cpu.send_message(ProcessingSupervisorMessage::RefreshCpuStats) {
+                    error!("Failed to send CPU refresh: {}", e);
+                    break;
+                }
+            }
+        });
+
+        // Initialize system with CPU info for monitoring
+        let mut system = System::new_all();
+        system.refresh_cpu_usage();
+        system.refresh_memory();
+        
         Ok(ProcessingSupervisorState {
             db_pool: args.db_pool,
             factory,
+            factory_config,
             total_accounts_processed: 0,
+            current_worker_count: initial_worker_count,
+            system,
         })
     }
 
@@ -180,6 +280,47 @@ impl Actor for ProcessingSupervisor {
                     event.user.id.key(),
                     event.user.name.as_deref().unwrap_or("Unknown")
                 );
+
+                // Check if we should scale workers
+                if state.current_worker_count < state.factory_config.max_workers {
+                    // Get current queue depth
+                    let queue_depth = match state.factory.call(
+                        |reply| FactoryMessage::GetQueueDepth(reply),
+                        Some(std::time::Duration::from_secs(1))
+                    ).await {
+                        Ok(ractor::rpc::CallResult::Success(depth)) => depth,
+                        _ => 0,
+                    };
+
+                    // If queue has pending work and we haven't hit max workers, scale up
+                    if queue_depth > 0 && state.current_worker_count < state.factory_config.max_workers {
+                        // Check system resources first
+                        let (can_scale, resource_status) = ProcessingSupervisor::can_add_workers(&mut state.system);
+                        
+                        if can_scale {
+                            let new_worker_count = std::cmp::min(
+                                state.current_worker_count + 1,
+                                state.factory_config.max_workers
+                            );
+                            
+                            info!(
+                                "Scaling workers from {} to {} (queue depth: {}, max: {}, resources: {})",
+                                state.current_worker_count, new_worker_count, queue_depth, 
+                                state.factory_config.max_workers, resource_status
+                            );
+                            
+                            if let Err(e) = state.factory
+                                .send_message(FactoryMessage::AdjustWorkerPool(new_worker_count))
+                            {
+                                error!("Failed to adjust worker pool: {:?}", e);
+                            } else {
+                                state.current_worker_count = new_worker_count;
+                            }
+                        } else {
+                            warn!("Cannot scale workers due to resource constraints: {}", resource_status);
+                        }
+                    }
+                }
 
                 // Submit account processing job for new accounts (is_new_account = true)
                 if let Err(e) = submit_account_processing_job(
@@ -255,6 +396,92 @@ impl Actor for ProcessingSupervisor {
                 });
             }
 
+            ProcessingSupervisorMessage::CheckWorkerScaling => {
+                // Get current queue depth and active workers
+                let queue_depth = match state.factory.call(
+                    |reply| FactoryMessage::GetQueueDepth(reply),
+                    Some(std::time::Duration::from_secs(1))
+                ).await {
+                    Ok(ractor::rpc::CallResult::Success(depth)) => depth,
+                    _ => 0,
+                };
+
+                let active_workers = match state.factory.call(
+                    |reply| FactoryMessage::GetNumActiveWorkers(reply),
+                    Some(std::time::Duration::from_secs(1))
+                ).await {
+                    Ok(ractor::rpc::CallResult::Success(count)) => count,
+                    _ => 0,
+                };
+
+                debug!(
+                    "Worker scaling check: queue_depth={}, active_workers={}, current_workers={}, max_workers={}",
+                    queue_depth, active_workers, state.current_worker_count, state.factory_config.max_workers
+                );
+
+                // Scale up if queue has work and we have capacity
+                if queue_depth > 0 && state.current_worker_count < state.factory_config.max_workers {
+                    // Check system resources first
+                    let (can_scale, resource_status) = ProcessingSupervisor::can_add_workers(&mut state.system);
+                    
+                    if can_scale {
+                        // Scale up by 10% of current workers or 1, whichever is greater
+                        let scale_increment = std::cmp::max(1, state.current_worker_count / 10);
+                        let new_worker_count = std::cmp::min(
+                            state.current_worker_count + scale_increment,
+                            state.factory_config.max_workers
+                        );
+                        
+                        if new_worker_count > state.current_worker_count {
+                            info!(
+                                "Scaling workers from {} to {} (queue depth: {}, active: {}, resources: {})",
+                                state.current_worker_count, new_worker_count, queue_depth, active_workers, resource_status
+                            );
+                            
+                            if let Err(e) = state.factory
+                                .send_message(FactoryMessage::AdjustWorkerPool(new_worker_count))
+                            {
+                                error!("Failed to adjust worker pool: {:?}", e);
+                            } else {
+                                state.current_worker_count = new_worker_count;
+                            }
+                        }
+                    } else {
+                        debug!("Skipping worker scale-up due to resource constraints: {}", resource_status);
+                    }
+                }
+                // Scale down if no queue and many idle workers
+                else if queue_depth == 0 && active_workers < state.current_worker_count / 2 
+                    && state.current_worker_count > state.factory_config.num_initial_workers {
+                    // Scale down by 10% but keep at least initial workers
+                    let scale_decrement = std::cmp::max(1, state.current_worker_count / 10);
+                    let new_worker_count = std::cmp::max(
+                        state.factory_config.num_initial_workers,
+                        state.current_worker_count.saturating_sub(scale_decrement)
+                    );
+                    
+                    if new_worker_count < state.current_worker_count {
+                        info!(
+                            "Scaling down workers from {} to {} (queue empty, active: {})",
+                            state.current_worker_count, new_worker_count, active_workers
+                        );
+                        
+                        if let Err(e) = state.factory
+                            .send_message(FactoryMessage::AdjustWorkerPool(new_worker_count))
+                        {
+                            error!("Failed to adjust worker pool: {:?}", e);
+                        } else {
+                            state.current_worker_count = new_worker_count;
+                        }
+                    }
+                }
+            }
+
+            ProcessingSupervisorMessage::RefreshCpuStats => {
+                // Refresh CPU usage for accurate readings
+                state.system.refresh_cpu_usage();
+            }
+
             ProcessingSupervisorMessage::GetStats(reply) => {
                 // Get factory statistics
                 let queue_depth = match
@@ -277,10 +504,29 @@ impl Actor for ProcessingSupervisor {
                     _ => 0,
                 };
 
+                // Get system resource info
+                state.system.refresh_memory();
+                state.system.refresh_cpu_usage();
+                
+                // Calculate average CPU usage
+                let cpu_count = state.system.cpus().len() as f32;
+                let total_cpu_usage: f32 = state.system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum();
+                let cpu_usage = if cpu_count > 0.0 { total_cpu_usage / cpu_count } else { 0.0 };
+                
+                let total_memory = state.system.total_memory();
+                let memory_usage_percent = if total_memory > 0 {
+                    (state.system.used_memory() as f64 / total_memory as f64) * 100.0
+                } else {
+                    0.0
+                };
+
                 let stats = ProcessingStats {
                     total_accounts_processed: state.total_accounts_processed,
                     factory_queue_depth: queue_depth,
                     factory_active_workers: active_workers,
+                    current_worker_count: state.current_worker_count,
+                    cpu_usage,
+                    memory_usage_percent,
                 };
 
                 if !reply.is_closed() {
