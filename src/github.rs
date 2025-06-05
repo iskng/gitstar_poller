@@ -89,6 +89,13 @@ impl GitHubClient {
                     continue;
                 }
                 status => {
+                    if status.as_u16() == 422 {
+                        // GitHub pagination limit - repos with too many stars
+                        let error_text = response.text().await.unwrap_or_default();
+                        return Err(GitHubStarsError::PaginationLimitExceeded(
+                            format!("Pagination limit exceeded: {}", error_text)
+                        ));
+                    }
                     let error_text = response.text().await.unwrap_or_default();
                     return Err(GitHubStarsError::ApiError(
                         format!("API request failed with status {}: {}", status, error_text)

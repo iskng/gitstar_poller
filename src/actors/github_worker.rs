@@ -342,6 +342,20 @@ impl GitHubWorker {
                     
                     return Err(GitHubStarsError::RateLimitExceeded(msg));
                 }
+                Err(GitHubStarsError::PaginationLimitExceeded(msg)) => {
+                    warn!("Pagination limit exceeded for repo {}: {}", repo_full_name, msg);
+                    
+                    // Mark repo as having too many stars for full processing
+                    db_conn
+                        .mark_repo_pagination_limited(repo_id, page - 1, total_stargazers)
+                        .await
+                        .map_err(|e| GitHubStarsError::ApiError(format!("Failed to mark repo as pagination limited: {}", e)))?;
+                    
+                    info!("Repo {} has too many stargazers (>{} pages), marked as pagination limited", 
+                        repo_full_name, page - 1);
+                    
+                    return Ok(()); // Don't treat as error, just skip
+                }
                 Err(e) => {
                     error!("Error processing repo {}: {:?}", repo_full_name, e);
                     

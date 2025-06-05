@@ -28,6 +28,9 @@ pub enum GitHubStarsError {
 
     #[error("Resource not found: {0}")]
     NotFound(String),
+    
+    #[error("Pagination limit exceeded: {0}")]
+    PaginationLimitExceeded(String),
 }
 
 pub type Result<T> = std::result::Result<T, GitHubStarsError>;

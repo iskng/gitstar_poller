@@ -190,6 +190,7 @@ impl SurrealClient {
                 WHERE repo = $repo_id 
                 AND (
                     status = 'completed' 
+                    OR status = 'pagination_limited'
                     OR (status = 'processing' AND claimed_at > (time::now() - duration::from::hours(1)))
                 )
             );
@@ -296,6 +297,32 @@ impl SurrealClient {
         Ok(())
     }
 
+    /// Mark repo as pagination limited (too many stars to fully process)
+    pub async fn mark_repo_pagination_limited(&self, repo_id: &RecordId, pages_processed: u32, stargazers_processed: usize) -> Result<()> {
+        let query =
+            r#"
+            UPDATE repo_processing_status SET
+                status = 'pagination_limited',
+                completed_at = time::now(),
+                last_page_processed = $pages,
+                processed_stargazers = $stargazers,
+                total_stargazers = $stargazers,
+                notes = 'Repository has too many stargazers for complete processing'
+            WHERE repo = $repo_id
+        "#;
+
+        self.db
+            .query(query)
+            .bind(("repo_id", repo_id.clone()))
+            .bind(("pages", pages_processed))
+            .bind(("stargazers", stargazers_processed as u32))
+            .await?;
+
+        info!("Marked repo {} as pagination limited after {} pages ({} stargazers)", 
+            repo_id.key(), pages_processed, stargazers_processed);
+        Ok(())
+    }
+
     /// Unclaim a repo (used on worker shutdown or error)
     pub async fn unclaim_repo(&self, repo_id: &RecordId) -> Result<()> {
         let query = r#"
@@ -339,7 +366,7 @@ impl SurrealClient {
         Ok(())
     }
 
-    /// Batch insert stargazers and create relationships
+    /// Batch insert stargazers and create relationships with retry logic
     pub async fn insert_stargazers_batch(
         &self,
         repo_id: &RecordId,
@@ -350,6 +377,34 @@ impl SurrealClient {
         }
 
         info!("Inserting batch of {} stargazers for repo {}", stargazers.len(), repo_id.key());
+        
+        // Retry logic for transaction conflicts
+        const MAX_RETRIES: u32 = 3;
+        let mut retries = 0;
+        
+        loop {
+            match self.insert_stargazers_batch_impl(repo_id, stargazers).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let error_str = e.to_string();
+                    if error_str.contains("transaction") && error_str.contains("conflict") && retries < MAX_RETRIES {
+                        retries += 1;
+                        warn!("Transaction conflict inserting stargazers for repo {}, retry {} of {}", 
+                            repo_id.key(), retries, MAX_RETRIES);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100 * retries as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+    
+    async fn insert_stargazers_batch_impl(
+        &self,
+        repo_id: &RecordId,
+        stargazers: &[crate::types::GitHubUser]
+    ) -> Result<()> {
 
         // First, upsert all github users
         for stargazer in stargazers {
@@ -488,6 +543,7 @@ impl SurrealClient {
                 count(status = 'failed') as failed,
                 count(status = 'rate_limited') as rate_limited,
                 count(status = 'pending') as pending,
+                count(status = 'pagination_limited') as pagination_limited,
                 math::sum(processed_stargazers) as total_stargazers_found
             FROM repo_processing_status
         "#;

@@ -76,6 +76,9 @@ pub struct ProcessingSupervisorState {
     total_accounts_processed: u64,
     current_worker_count: usize,
     system: System,
+    // Hourly statistics tracking
+    last_hour_accounts_processed: u64,
+    last_diagnostic_time: std::time::Instant,
 }
 
 /// Messages the supervisor can handle
@@ -89,6 +92,8 @@ pub enum ProcessingSupervisorMessage {
     CheckWorkerScaling,
     /// Refresh CPU statistics
     RefreshCpuStats,
+    /// Print hourly diagnostics
+    PrintDiagnostics,
     /// Get statistics about processing
     GetStats(RpcReplyPort<ProcessingStats>),
     /// Shutdown the system
@@ -252,6 +257,22 @@ impl Actor for ProcessingSupervisor {
             }
         });
 
+        // Spawn hourly diagnostic reporting task
+        let myself_for_diagnostics = myself.clone();
+        tokio::spawn(async move {
+            let mut diagnostic_interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // Every hour
+            diagnostic_interval.tick().await; // Skip first immediate tick
+
+            loop {
+                diagnostic_interval.tick().await;
+                // Send message to print diagnostics
+                if let Err(e) = myself_for_diagnostics.send_message(ProcessingSupervisorMessage::PrintDiagnostics) {
+                    error!("Failed to send diagnostic request: {}", e);
+                    break;
+                }
+            }
+        });
+
         // Initialize system with CPU info for monitoring
         let mut system = System::new_all();
         system.refresh_cpu_usage();
@@ -264,6 +285,8 @@ impl Actor for ProcessingSupervisor {
             total_accounts_processed: 0,
             current_worker_count: initial_worker_count,
             system,
+            last_hour_accounts_processed: 0,
+            last_diagnostic_time: std::time::Instant::now(),
         })
     }
 
@@ -333,6 +356,7 @@ impl Actor for ProcessingSupervisor {
                 } else {
                     info!("Submitted high priority account processing job for new user {}", event.user.id.key());
                     state.total_accounts_processed += 1;
+                    state.last_hour_accounts_processed += 1;
                 }
             }
 
@@ -480,6 +504,115 @@ impl Actor for ProcessingSupervisor {
             ProcessingSupervisorMessage::RefreshCpuStats => {
                 // Refresh CPU usage for accurate readings
                 state.system.refresh_cpu_usage();
+            }
+
+            ProcessingSupervisorMessage::PrintDiagnostics => {
+                // Get current statistics
+                let elapsed = state.last_diagnostic_time.elapsed();
+                let hours_elapsed = elapsed.as_secs_f64() / 3600.0;
+                
+                // Get factory statistics
+                let queue_depth = match state.factory.call(
+                    |reply| FactoryMessage::GetQueueDepth(reply),
+                    Some(std::time::Duration::from_secs(1))
+                ).await {
+                    Ok(ractor::rpc::CallResult::Success(depth)) => depth,
+                    _ => 0,
+                };
+
+                let active_workers = match state.factory.call(
+                    |reply| FactoryMessage::GetNumActiveWorkers(reply),
+                    Some(std::time::Duration::from_secs(1))
+                ).await {
+                    Ok(ractor::rpc::CallResult::Success(count)) => count,
+                    _ => 0,
+                };
+
+                // Get system resource info
+                state.system.refresh_memory();
+                let cpu_count = state.system.cpus().len() as f32;
+                let total_cpu_usage: f32 = state.system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum();
+                let avg_cpu = if cpu_count > 0.0 { total_cpu_usage / cpu_count } else { 0.0 };
+                
+                let total_memory = state.system.total_memory();
+                let memory_usage_percent = if total_memory > 0 {
+                    (state.system.used_memory() as f64 / total_memory as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                // Get processing stats from database
+                let db_stats = match state.db_pool.get().await {
+                    Ok(db_conn) => {
+                        match db_conn.get_processing_stats().await {
+                            Ok(stats) => stats,
+                            Err(e) => {
+                                error!("Failed to get processing stats: {}", e);
+                                serde_json::json!({})
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to get DB connection for stats: {}", e);
+                        serde_json::json!({})
+                    }
+                };
+
+                // Calculate hourly rate
+                let accounts_per_hour = if hours_elapsed > 0.0 {
+                    (state.last_hour_accounts_processed as f64 / hours_elapsed) as u64
+                } else {
+                    state.last_hour_accounts_processed
+                };
+
+                debug!("=== HOURLY DIAGNOSTIC REPORT ===");
+                debug!("Time since last report: {:.1} hours", hours_elapsed);
+                debug!("");
+                debug!("PROCESSING STATISTICS:");
+                debug!("  Total accounts processed (all time): {}", state.total_accounts_processed);
+                debug!("  Accounts processed (last period): {}", state.last_hour_accounts_processed);
+                debug!("  Processing rate: {} accounts/hour", accounts_per_hour);
+                debug!("");
+                debug!("WORKER STATISTICS:");
+                debug!("  Total workers: {}", state.current_worker_count);
+                debug!("  Active workers: {}", active_workers);
+                debug!("  Queue depth: {}", queue_depth);
+                debug!("");
+                debug!("SYSTEM RESOURCES:");
+                debug!("  CPU usage: {:.1}%", avg_cpu);
+                debug!("  Memory usage: {:.1}%", memory_usage_percent);
+                debug!("  Memory: {} MB / {} MB", 
+                    state.system.used_memory() / 1024 / 1024,
+                    total_memory / 1024 / 1024
+                );
+                debug!("");
+                debug!("DATABASE STATISTICS:");
+                if let Some(completed) = db_stats.get("completed") {
+                    debug!("  Repos completed: {}", completed);
+                }
+                if let Some(processing) = db_stats.get("processing") {
+                    debug!("  Repos processing: {}", processing);
+                }
+                if let Some(failed) = db_stats.get("failed") {
+                    debug!("  Repos failed: {}", failed);
+                }
+                if let Some(pending) = db_stats.get("pending") {
+                    debug!("  Repos pending: {}", pending);
+                }
+                if let Some(rate_limited) = db_stats.get("rate_limited") {
+                    debug!("  Repos rate limited: {}", rate_limited);
+                }
+                if let Some(pagination_limited) = db_stats.get("pagination_limited") {
+                    debug!("  Repos pagination limited: {}", pagination_limited);
+                }
+                if let Some(total_stargazers) = db_stats.get("total_stargazers_found") {
+                    debug!("  Total stargazers found: {}", total_stargazers);
+                }
+                debug!("================================");
+                
+                // Reset hourly counters
+                state.last_hour_accounts_processed = 0;
+                state.last_diagnostic_time = std::time::Instant::now();
             }
 
             ProcessingSupervisorMessage::GetStats(reply) => {
