@@ -545,16 +545,16 @@ impl Actor for ProcessingSupervisor {
                 let db_stats = match state.db_pool.get().await {
                     Ok(db_conn) => {
                         match db_conn.get_processing_stats().await {
-                            Ok(stats) => stats,
+                            Ok(stats) => Some(stats),
                             Err(e) => {
                                 error!("Failed to get processing stats: {}", e);
-                                serde_json::json!({})
+                                None
                             }
                         }
                     }
                     Err(e) => {
                         error!("Failed to get DB connection for stats: {}", e);
-                        serde_json::json!({})
+                        None
                     }
                 };
 
@@ -576,7 +576,9 @@ impl Actor for ProcessingSupervisor {
                 debug!("WORKER STATISTICS:");
                 debug!("  Total workers: {}", state.current_worker_count);
                 debug!("  Active workers: {}", active_workers);
+                debug!("  Idle workers: {}", state.current_worker_count.saturating_sub(active_workers));
                 debug!("  Queue depth: {}", queue_depth);
+                debug!("  Dead man's switch timeout: 6 hours");
                 debug!("");
                 debug!("SYSTEM RESOURCES:");
                 debug!("  CPU usage: {:.1}%", avg_cpu);
@@ -587,26 +589,16 @@ impl Actor for ProcessingSupervisor {
                 );
                 debug!("");
                 debug!("DATABASE STATISTICS:");
-                if let Some(completed) = db_stats.get("completed") {
-                    debug!("  Repos completed: {}", completed);
-                }
-                if let Some(processing) = db_stats.get("processing") {
-                    debug!("  Repos processing: {}", processing);
-                }
-                if let Some(failed) = db_stats.get("failed") {
-                    debug!("  Repos failed: {}", failed);
-                }
-                if let Some(pending) = db_stats.get("pending") {
-                    debug!("  Repos pending: {}", pending);
-                }
-                if let Some(rate_limited) = db_stats.get("rate_limited") {
-                    debug!("  Repos rate limited: {}", rate_limited);
-                }
-                if let Some(pagination_limited) = db_stats.get("pagination_limited") {
-                    debug!("  Repos pagination limited: {}", pagination_limited);
-                }
-                if let Some(total_stargazers) = db_stats.get("total_stargazers_found") {
-                    debug!("  Total stargazers found: {}", total_stargazers);
+                if let Some(stats) = db_stats {
+                    debug!("  Repos completed: {}", stats.completed);
+                    debug!("  Repos processing: {}", stats.processing);
+                    debug!("  Repos failed: {}", stats.failed);
+                    debug!("  Repos pending: {}", stats.pending);
+                    debug!("  Repos rate limited: {}", stats.rate_limited);
+                    debug!("  Repos pagination limited: {}", stats.pagination_limited);
+                    debug!("  Total stargazers found: {}", stats.total_stargazers_found);
+                } else {
+                    debug!("  Failed to retrieve database statistics");
                 }
                 debug!("================================");
                 

@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
         num_initial_workers: num_workers,
         max_workers: 1000,
         queue_capacity: 1000,
-        dead_mans_switch_timeout_seconds: 10000, // 10000 seconds = 2 hours 46 minutes 40 seconds
+        dead_mans_switch_timeout_seconds: 21600, // 6 hours - allows processing large repos
     };
 
     // Start the processing supervisor with live query

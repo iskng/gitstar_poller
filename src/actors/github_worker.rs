@@ -74,6 +74,9 @@ pub struct GitHubWorkerState {
     current_claimed_repo: Option<RecordId>,
     // Flag to indicate shutdown is in progress
     shutting_down: bool,
+    // Track current processing state for monitoring
+    current_processing_repo: Option<String>,
+    processing_start_time: Option<Instant>,
 }
 
 impl GitHubWorker {
@@ -105,6 +108,8 @@ impl Actor for GitHubWorker {
             current_account: None,
             current_claimed_repo: None,
             shutting_down: false,
+            current_processing_repo: None,
+            processing_start_time: None,
         })
     }
 
@@ -328,6 +333,15 @@ impl GitHubWorker {
                     
                     debug!("Rate limit remaining: {}/{}, delaying {}ms", 
                         rate_limit_state.remaining, rate_limit_state.limit, delay_ms);
+                    
+                    // Log progress every 10 pages for monitoring
+                    if page % 10 == 0 {
+                        info!(
+                            "Worker progress: Processing repo {} - page {}, {} stargazers so far",
+                            repo_full_name, page, total_stargazers
+                        );
+                    }
+                    
                     sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Err(GitHubStarsError::RateLimitExceeded(msg)) => {
@@ -503,6 +517,8 @@ impl GitHubWorker {
 
             // Set current claimed repo before processing
             state.current_claimed_repo = Some(repo_id.clone());
+            state.current_processing_repo = Some(repo_full_name.clone());
+            state.processing_start_time = Some(Instant::now());
             
             // Process the repository
             let process_result = self.process_repository(
@@ -516,6 +532,8 @@ impl GitHubWorker {
             
             // Clear current claimed repo after processing (success or failure)
             state.current_claimed_repo = None;
+            state.current_processing_repo = None;
+            state.processing_start_time = None;
             
             if let Err(e) = process_result {
                 error!("Failed to process repo {}: {:?}", repo_full_name, e);

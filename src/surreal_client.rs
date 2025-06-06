@@ -1,5 +1,6 @@
 use anyhow::{ Context, Result };
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
@@ -19,6 +20,18 @@ use crate::models::{
 #[derive(Clone, Debug)]
 pub struct SurrealClient {
     pub db: Surreal<Any>,
+}
+
+/// Statistics about repository processing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingStats {
+    pub completed: u64,
+    pub processing: u64,
+    pub failed: u64,
+    pub rate_limited: u64,
+    pub pending: u64,
+    pub pagination_limited: u64,
+    pub total_stargazers_found: u64,
 }
 
 impl SurrealClient {
@@ -534,23 +547,53 @@ impl SurrealClient {
     }
 
     /// Get processing statistics
-    pub async fn get_processing_stats(&self) -> Result<serde_json::Value> {
+    pub async fn get_processing_stats(&self) -> Result<ProcessingStats> {
         let query =
             r#"
-            SELECT 
-                count(status = 'completed') as completed,
-                count(status = 'processing') as processing,
-                count(status = 'failed') as failed,
-                count(status = 'rate_limited') as rate_limited,
-                count(status = 'pending') as pending,
-                count(status = 'pagination_limited') as pagination_limited,
-                math::sum(processed_stargazers) as total_stargazers_found
-            FROM repo_processing_status
+            -- Get count statistics
+            LET $stats = (
+                SELECT 
+                    count(status = 'completed') as completed,
+                    count(status = 'processing') as processing,
+                    count(status = 'failed') as failed,
+                    count(status = 'rate_limited') as rate_limited,
+                    count(status = 'pending') as pending,
+                    count(status = 'pagination_limited') as pagination_limited
+                FROM repo_processing_status
+            );
+            
+            -- Get all processed_stargazers values
+            LET $stargazers = SELECT processed_stargazers FROM repo_processing_status WHERE processed_stargazers IS NOT NULL;
+            
+            -- Extract the processed_stargazers values into an array
+            LET $stargazersArray = $stargazers.map(|$record| $record.processed_stargazers);
+            
+            -- Calculate the sum of the array
+            LET $totalStargazers = math::sum($stargazersArray);
+            
+            -- Return combined stats
+            RETURN {
+                completed: $stats[0].completed,
+                processing: $stats[0].processing,
+                failed: $stats[0].failed,
+                rate_limited: $stats[0].rate_limited,
+                pending: $stats[0].pending,
+                pagination_limited: $stats[0].pagination_limited,
+                total_stargazers_found: $totalStargazers
+            };
         "#;
 
         let mut result = self.db.query(query).await?;
-        let stats: Option<serde_json::Value> = result.take(0)?;
-        Ok(stats.unwrap_or(json!({})))
+        let stats: Option<ProcessingStats> = result.take(0)?;
+        Ok(stats.unwrap_or(ProcessingStats {
+            completed: 0,
+            processing: 0,
+            failed: 0,
+            rate_limited: 0,
+            pending: 0,
+            pagination_limited: 0,
+            total_stargazers_found: 0,
+        }))
     }
 
     /// Get processing status for multiple repos

@@ -42,7 +42,7 @@ impl Default for GitHubFactoryConfig {
             num_initial_workers: 5,
             max_workers: 1000,
             queue_capacity: 1000,
-            dead_mans_switch_timeout_seconds: 100000, // 5 minutes
+            dead_mans_switch_timeout_seconds: 21600, // 6 hours
         }
     }
 }
