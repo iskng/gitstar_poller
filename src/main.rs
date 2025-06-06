@@ -22,11 +22,11 @@ async fn main() -> Result<()> {
     // Load .env file if it exists
     dotenv::dotenv().ok();
 
-    // Initialize tracing with WARN level by default
+    // Initialize tracing with DEBUG level by default
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("warn"))
+                .unwrap_or_else(|_| EnvFilter::new("debug"))
         )
         .init();
 
