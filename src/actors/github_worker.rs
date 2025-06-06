@@ -448,7 +448,9 @@ impl GitHubWorker {
             .into_iter()
             .filter(|s| matches!(
                 s.status,
-                crate::models::ProcessingStatus::Completed | crate::models::ProcessingStatus::Processing
+                crate::models::ProcessingStatus::Completed | 
+                crate::models::ProcessingStatus::Processing |
+                crate::models::ProcessingStatus::PaginationLimited
             ))
             .map(|s| s.repo.key().to_string())
             .collect();

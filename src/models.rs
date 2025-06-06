@@ -118,6 +118,7 @@ pub enum ProcessingStatus {
     Completed,
     Failed,
     RateLimited,
+    PaginationLimited,
 }
 
 /// GitHub user (stargazer)
