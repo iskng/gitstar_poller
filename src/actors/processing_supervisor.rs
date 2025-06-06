@@ -565,42 +565,42 @@ impl Actor for ProcessingSupervisor {
                     state.last_hour_accounts_processed
                 };
 
-                debug!("=== HOURLY DIAGNOSTIC REPORT ===");
-                debug!("Time since last report: {:.1} hours", hours_elapsed);
-                debug!("");
-                debug!("PROCESSING STATISTICS:");
-                debug!("  Total accounts processed (all time): {}", state.total_accounts_processed);
-                debug!("  Accounts processed (last period): {}", state.last_hour_accounts_processed);
-                debug!("  Processing rate: {} accounts/hour", accounts_per_hour);
-                debug!("");
-                debug!("WORKER STATISTICS:");
-                debug!("  Total workers: {}", state.current_worker_count);
-                debug!("  Active workers: {}", active_workers);
-                debug!("  Idle workers: {}", state.current_worker_count.saturating_sub(active_workers));
-                debug!("  Queue depth: {}", queue_depth);
-                debug!("  Dead man's switch timeout: 6 hours");
-                debug!("");
-                debug!("SYSTEM RESOURCES:");
-                debug!("  CPU usage: {:.1}%", avg_cpu);
-                debug!("  Memory usage: {:.1}%", memory_usage_percent);
-                debug!("  Memory: {} MB / {} MB", 
+                info!("=== HOURLY DIAGNOSTIC REPORT ===");
+                info!("Time since last report: {:.1} hours", hours_elapsed);
+                info!("");
+                info!("PROCESSING STATISTICS:");
+                info!("  Total accounts processed (all time): {}", state.total_accounts_processed);
+                info!("  Accounts processed (last period): {}", state.last_hour_accounts_processed);
+                info!("  Processing rate: {} accounts/hour", accounts_per_hour);
+                info!("");
+                info!("WORKER STATISTICS:");
+                info!("  Total workers: {}", state.current_worker_count);
+                info!("  Active workers: {}", active_workers);
+                info!("  Idle workers: {}", state.current_worker_count.saturating_sub(active_workers));
+                info!("  Queue depth: {}", queue_depth);
+                info!("  Dead man's switch timeout: 6 hours");
+                info!("");
+                info!("SYSTEM RESOURCES:");
+                info!("  CPU usage: {:.1}%", avg_cpu);
+                info!("  Memory usage: {:.1}%", memory_usage_percent);
+                info!("  Memory: {} MB / {} MB", 
                     state.system.used_memory() / 1024 / 1024,
                     total_memory / 1024 / 1024
                 );
-                debug!("");
-                debug!("DATABASE STATISTICS:");
+                info!("");
+                info!("DATABASE STATISTICS:");
                 if let Some(stats) = db_stats {
-                    debug!("  Repos completed: {}", stats.completed);
-                    debug!("  Repos processing: {}", stats.processing);
-                    debug!("  Repos failed: {}", stats.failed);
-                    debug!("  Repos pending: {}", stats.pending);
-                    debug!("  Repos rate limited: {}", stats.rate_limited);
-                    debug!("  Repos pagination limited: {}", stats.pagination_limited);
-                    debug!("  Total stargazers found: {}", stats.total_stargazers_found);
+                    info!("  Repos completed: {}", stats.completed);
+                    info!("  Repos processing: {}", stats.processing);
+                    info!("  Repos failed: {}", stats.failed);
+                    info!("  Repos pending: {}", stats.pending);
+                    info!("  Repos rate limited: {}", stats.rate_limited);
+                    info!("  Repos pagination limited: {}", stats.pagination_limited);
+                    info!("  Total stargazers found: {}", stats.total_stargazers_found);
                 } else {
-                    debug!("  Failed to retrieve database statistics");
+                    info!("  Failed to retrieve database statistics");
                 }
-                debug!("================================");
+                info!("================================");
                 
                 // Reset hourly counters
                 state.last_hour_accounts_processed = 0;

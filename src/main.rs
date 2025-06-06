@@ -22,11 +22,11 @@ async fn main() -> Result<()> {
     // Load .env file if it exists
     dotenv::dotenv().ok();
 
-    // Initialize tracing with DEBUG level by default
+    // Initialize tracing with INFO level for our crate, WARN for everything else
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("debug"))
+                .unwrap_or_else(|_| EnvFilter::new("warn,github_stars_server=info"))
         )
         .init();
 

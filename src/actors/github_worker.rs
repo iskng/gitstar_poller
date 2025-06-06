@@ -248,7 +248,7 @@ impl GitHubWorker {
         db_pool: &Arc<SurrealPool>,
         rate_limit_state: &mut RateLimitState,
     ) -> Result<()> {
-        info!("Processing repository {} for user {}", repo_full_name, user_id.key());
+        debug!("Processing repository {} for user {}", repo_full_name, user_id.key());
 
         // Get a connection from the pool for this job
         let db_conn = db_pool.get().await
@@ -262,7 +262,7 @@ impl GitHubWorker {
                 // Note: We can't modify state here since we don't have mutable access
             }
             Ok(false) => {
-                info!("Repo {} already being processed by another worker", repo_full_name);
+                debug!("Repo {} already being processed by another worker", repo_full_name);
                 return Ok(()); // Skip this repo
             }
             Err(e) => {
@@ -286,7 +286,7 @@ impl GitHubWorker {
                     let stargazers_count = stargazers.len();
                     total_stargazers += stargazers_count;
 
-                    info!(
+                    debug!(
                         "Fetched page {} with {} stargazers for repo {} (rate limit: {}/{})",
                         page, stargazers_count, repo_full_name, 
                         rate_limit_state.remaining, rate_limit_state.limit
@@ -294,7 +294,7 @@ impl GitHubWorker {
 
                     if !stargazers.is_empty() {
                         // Insert stargazers in batch
-                        info!("Inserting {} stargazers for repo {}", stargazers_count, repo_full_name);
+                        debug!("Inserting {} stargazers for repo {}", stargazers_count, repo_full_name);
                         db_conn
                             .insert_stargazers_batch(repo_id, &stargazers)
                             .await
@@ -487,7 +487,7 @@ impl GitHubWorker {
                 break;
             }
             
-            info!("Processing repo {} ({} remaining in queue)", repo_full_name, state.repo_queue.len());
+            debug!("Processing repo {} ({} remaining in queue)", repo_full_name, state.repo_queue.len());
 
             // Check rate limit before each repo
             if state.rate_limit_state.is_limited {
