@@ -298,7 +298,7 @@ impl Actor for ProcessingSupervisor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             ProcessingSupervisorMessage::NewAccount(event) => {
-                info!(
+                debug!(
                     "New GitHub account detected for user {} ({})",
                     event.user.id.key(),
                     event.user.name.as_deref().unwrap_or("Unknown")
@@ -384,7 +384,7 @@ impl Actor for ProcessingSupervisor {
                                             break;
                                         }
                                         
-                                        info!("Fetched {} existing accounts to process (offset: {})", accounts.len(), offset);
+                                        debug!("Fetched {} existing accounts to process (offset: {})", accounts.len(), offset);
                                         
                                         // Submit all existing accounts (is_new_account = false)
                                         for account in accounts {

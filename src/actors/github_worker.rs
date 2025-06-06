@@ -96,7 +96,7 @@ impl Actor for GitHubWorker {
         _myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> std::result::Result<Self::State, ActorProcessingErr> {
-        info!(worker_id = ?args.wid, "GitHub worker starting");
+        debug!(worker_id = ?args.wid, "GitHub worker starting");
         
         Ok(GitHubWorkerState {
             worker_id: args.wid,
@@ -175,7 +175,7 @@ impl Actor for GitHubWorker {
 
                 match result {
                     Ok(_) => {
-                        info!(
+                        debug!(
                             worker_id = ?state.worker_id,
                             ?job_key,
                             jobs_processed = state.jobs_processed,
@@ -405,7 +405,7 @@ impl GitHubWorker {
         is_new_account: bool,
         state: &mut GitHubWorkerState,
     ) -> Result<()> {
-        info!("Processing {} account for user {}", 
+        debug!("Processing {} account for user {}", 
             if is_new_account { "new" } else { "existing" },
             user_id.key()
         );
@@ -417,10 +417,10 @@ impl GitHubWorker {
         // Only wait for repo sync if this is a new account
         // For existing accounts, repos are already synced
         if is_new_account {
-            info!("Waiting for repo sync to complete for new account");
+            debug!("Waiting for repo sync to complete for new account");
             self.wait_for_repo_sync(&state.db_pool, user_id).await?;
         } else {
-            info!("Skipping repo sync wait for existing account");
+            debug!("Skipping repo sync wait for existing account");
         }
 
         // Get all repos for this user
@@ -435,7 +435,7 @@ impl GitHubWorker {
 
         // Sort repos by star count (lowest first) for faster initial processing
         repos.sort_by_key(|r| r.stars);
-        info!("Found {} repos for user {}, processing from smallest to largest", repos.len(), user_id.key());
+        debug!("Found {} repos for user {}, processing from smallest to largest", repos.len(), user_id.key());
 
         // Get processing status for all repos
         let repo_ids: Vec<String> = repos.iter().map(|r| r.full_name.clone()).collect();
@@ -471,7 +471,7 @@ impl GitHubWorker {
             queued_count += 1;
         }
 
-        info!(
+        debug!(
             "Queued {} repos for user {} ({} skipped as already processed)",
             queued_count, user_id.key(), skipped_count
         );
@@ -548,7 +548,7 @@ impl GitHubWorker {
         // Clear account info when done
         state.current_account = None;
         
-        info!("Completed processing all repos for user {}", user_id.key());
+        debug!("Completed processing all repos for user {}", user_id.key());
         Ok(())
     }
 

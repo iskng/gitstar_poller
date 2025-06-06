@@ -90,7 +90,7 @@ impl SurrealClient {
         }
 
         let github_user_id = users[0].github_user.as_ref().unwrap();
-        info!("Found github_user {} for user {}", github_user_id.key(), user_id.key());
+        debug!("Found github_user {} for user {}", github_user_id.key(), user_id.key());
 
         // Now query all starred repos for this github_user
         let query =
@@ -139,7 +139,7 @@ impl SurrealClient {
             return Ok(Vec::new());
         }
 
-        info!("User {} has {} starred repos", user_id.key(), starred_results.len());
+        debug!("User {} has {} starred repos", user_id.key(), starred_results.len());
 
         // Convert to Repo structs
         let repos: Vec<Repo> = starred_results
