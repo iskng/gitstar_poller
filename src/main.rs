@@ -13,6 +13,7 @@ use clap::Parser;
 use cli::Cli;
 use colored::*;
 use error::{ GitHubStarsError, Result };
+use health::{AppState, start_health_server};
 use pool::{ create_pool, PoolConfig, SurrealConnectionConfig };
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;

@@ -42,4 +42,8 @@ pub struct Cli {
     /// Connection timeout in seconds
     #[arg(long, env = "DB_CONNECTION_TIMEOUT", default_value = "30")]
     pub db_connection_timeout: u64,
+
+    /// Health check server port (0 to disable)
+    #[arg(long, env = "HEALTH_PORT", default_value = "8080")]
+    pub health_port: u16,
 }

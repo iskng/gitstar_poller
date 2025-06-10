@@ -34,6 +34,9 @@ surrealdb = { version = "2.3", features = ["protocol-ws", "protocol-http"] }
 futures = "0.3"
 deadpool = { version = "0.12.2", features = ["rt_tokio_1"] }
 sysinfo = "0.35.2"
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
