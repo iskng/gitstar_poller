@@ -206,7 +206,12 @@ The server integrates with a Next.js application that:
   - Worker progress updates every 10 pages
   - Override with RUST_LOG environment variable
 - **Hourly Diagnostics**: Reports processing stats, worker status, system resources, and database metrics
-- **Health Checks**: Connection pool validates connections
+- **Health Checks**: 
+  - HTTP health check server on port 8080 (configurable)
+  - `/health` or `/healthz` - Comprehensive health status with statistics
+  - `/livez` - Kubernetes liveness probe (simple alive check)
+  - `/readyz` - Kubernetes readiness probe (checks DB and supervisor)
+  - Returns 503 when unhealthy, 200 when healthy/degraded
 - **Graceful Shutdown**: Ctrl+C triggers clean shutdown with final stats
 
 ### Dependencies
