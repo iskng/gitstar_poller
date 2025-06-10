@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    command: start --bind 0.0.0.0:8000 --user root --pass root --log info memory --allow-all
+    ports:
+      - "8000:8000"
+    volumes:
+      - surrealdb-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - github-stars
+
+  github-stars-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+    environment:
+      - DB_URL=ws://surrealdb:8000
+      - DB_USER=root
+      - DB_PASS=root
+      - DB_NAMESPACE=gitstars
+      - DB_DATABASE=stars
+      - DB_POOL_MAX_SIZE=10
+      - HEALTH_PORT=8080
+      - RUST_LOG=warn,github_stars_server=info
+    ports:
+      - "8080:8080"  # Health check port
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - github-stars
+    restart: unless-stopped
+
+volumes:
+  surrealdb-data:
+
+networks:
+  github-stars:
+    driver: bridge

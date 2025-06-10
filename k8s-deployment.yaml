@@ -1,0 +1,162 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: github-stars
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+  namespace: github-stars
+type: Opaque
+stringData:
+  db-user: "root"
+  db-pass: "your-secure-password"  # Change this!
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: github-stars-config
+  namespace: github-stars
+data:
+  DB_URL: "ws://surrealdb:8000"
+  DB_NAMESPACE: "gitstars"
+  DB_DATABASE: "stars"
+  DB_POOL_MAX_SIZE: "20"
+  DB_POOL_MIN_IDLE: "5"
+  HEALTH_PORT: "8080"
+  RUST_LOG: "warn,github_stars_server=info"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-stars-server
+  namespace: github-stars
+  labels:
+    app: github-stars-server
+spec:
+  replicas: 1  # Single instance due to actor system state
+  selector:
+    matchLabels:
+      app: github-stars-server
+  template:
+    metadata:
+      labels:
+        app: github-stars-server
+    spec:
+      containers:
+      - name: server
+        image: github-stars-server:latest
+        imagePullPolicy: Always
+        ports:
+        - name: health
+          containerPort: 8080
+          protocol: TCP
+        env:
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: db-user
+        - name: DB_PASS
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: db-pass
+        envFrom:
+        - configMapRef:
+            name: github-stars-config
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: health
+          initialDelaySeconds: 0
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30  # Allow up to 5 minutes for startup
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-stars-server
+  namespace: github-stars
+  labels:
+    app: github-stars-server
+spec:
+  type: ClusterIP
+  ports:
+  - name: health
+    port: 8080
+    targetPort: health
+    protocol: TCP
+  selector:
+    app: github-stars-server
+---
+# Optional: HorizontalPodAutoscaler
+# Note: Since this uses actor system with internal state,
+# scaling horizontally would require careful consideration
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: github-stars-server
+  namespace: github-stars
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: github-stars-server
+  minReplicas: 1
+  maxReplicas: 1  # Keep at 1 for now due to actor system
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+# ServiceMonitor for Prometheus (if using Prometheus Operator)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: github-stars-server
+  namespace: github-stars
+  labels:
+    app: github-stars-server
+spec:
+  selector:
+    matchLabels:
+      app: github-stars-server
+  endpoints:
+  - port: health
+    interval: 30s
+    path: /health

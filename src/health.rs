@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::info;
 
 /// Health check status
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,7 +128,7 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
         Ok(call_result) => {
             match call_result {
                 ractor::rpc::CallResult::Success(stats) => {
-                    let worker_status = if stats.factory_active_workers == 0 && stats.factory_queue_depth > 0 {
+                    let _worker_status = if stats.factory_active_workers == 0 && stats.factory_queue_depth > 0 {
                         HealthStatus::Degraded
                     } else {
                         HealthStatus::Healthy

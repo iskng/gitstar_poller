@@ -116,6 +116,7 @@ cargo run -- --help
 - `--db-pool-max-size <N>` - Maximum pool connections (default: 10)
 - `--db-pool-min-idle <N>` - Minimum idle connections (default: 2)
 - `--db-connection-timeout <SECS>` - Connection timeout in seconds (default: 30)
+- `--health-port <PORT>` - Health check server port (default: 8080, set to 0 to disable)
 
 ### Server Architecture
 

@@ -6,5 +6,3 @@ pub mod models;
 pub mod pool;
 pub mod surreal_client;
 pub mod types;
-
-pub use surreal_client::ProcessingStats;

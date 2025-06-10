@@ -100,7 +100,7 @@ pub enum ProcessingSupervisorMessage {
     Shutdown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProcessingStats {
     pub total_accounts_processed: u64,
     pub factory_queue_depth: usize,
