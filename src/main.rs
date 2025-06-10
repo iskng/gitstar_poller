@@ -2,6 +2,7 @@ mod actors;
 mod cli;
 mod error;
 mod github;
+mod health;
 mod models;
 mod pool;
 mod surreal_client;
@@ -100,6 +101,28 @@ async fn main() -> Result<()> {
 
     println!("✅ Processing supervisor started with {} workers", num_workers);
     println!("📡 Listening for new GitHub accounts...");
+    
+    // Start health check server if enabled
+    let health_handle = if cli.health_port > 0 {
+        let app_state = AppState {
+            db_pool: db_pool.clone(),
+            supervisor: supervisor.clone(),
+            start_time: std::time::Instant::now(),
+        };
+        
+        let health_port = cli.health_port;
+        let handle = tokio::spawn(async move {
+            if let Err(e) = start_health_server(app_state, health_port).await {
+                eprintln!("Health check server error: {}", e);
+            }
+        });
+        
+        println!("🏥 Health check server listening on http://0.0.0.0:{}", cli.health_port);
+        Some(handle)
+    } else {
+        None
+    };
+    
     println!("\nPress Ctrl+C to stop the server\n");
 
     // Set up graceful shutdown
@@ -143,6 +166,12 @@ async fn main() -> Result<()> {
             // Give actors time to clean up
             println!("Waiting for workers to finish current tasks...");
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            
+            // Stop health check server if running
+            if let Some(handle) = health_handle {
+                handle.abort();
+                println!("✅ Health check server stopped");
+            }
             
             println!("✅ Server stopped");
         }
