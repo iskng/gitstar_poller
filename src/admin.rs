@@ -3,7 +3,7 @@ use crate::pool::SurrealPool;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -128,8 +128,18 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .with_state(state)
 }
 
+// Helper function to create error response
+fn error_response(status: StatusCode, message: String) -> Response {
+    (status, Json(ErrorResponse { error: message })).into_response()
+}
+
+// Helper function to create success response
+fn success_response(message: String) -> Response {
+    (StatusCode::OK, Json(SuccessResponse { success: true, message })).into_response()
+}
+
 /// Get detailed statistics
-async fn get_detailed_stats(State(state): State<AdminState>) -> impl IntoResponse {
+async fn get_detailed_stats(State(state): State<AdminState>) -> Response {
     // Get processing stats from supervisor
     let processing_stats = match state.supervisor.call(
         |reply| ProcessingSupervisorMessage::GetStats(reply),
@@ -137,12 +147,10 @@ async fn get_detailed_stats(State(state): State<AdminState>) -> impl IntoRespons
     ).await {
         Ok(ractor::rpc::CallResult::Success(stats)) => stats,
         _ => {
-            return (
+            return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "Failed to get processing statistics".to_string(),
-                }),
-            ).into_response();
+                "Failed to get processing statistics".to_string()
+            );
         }
     };
     
@@ -151,12 +159,10 @@ async fn get_detailed_stats(State(state): State<AdminState>) -> impl IntoRespons
         Ok(stats) => stats,
         Err(e) => {
             error!("Failed to get database stats: {}", e);
-            return (
+            return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to get database statistics: {}", e),
-                }),
-            ).into_response();
+                format!("Failed to get database statistics: {}", e)
+            );
         }
     };
     
@@ -174,7 +180,7 @@ async fn get_detailed_stats(State(state): State<AdminState>) -> impl IntoRespons
 }
 
 /// Get summary statistics
-async fn get_summary_stats(State(state): State<AdminState>) -> impl IntoResponse {
+async fn get_summary_stats(State(state): State<AdminState>) -> Response {
     match state.supervisor.call(
         |reply| ProcessingSupervisorMessage::GetStats(reply),
         Some(Duration::from_secs(5))
@@ -182,12 +188,10 @@ async fn get_summary_stats(State(state): State<AdminState>) -> impl IntoResponse
         Ok(ractor::rpc::CallResult::Success(stats)) => {
             (StatusCode::OK, Json(stats)).into_response()
         }
-        _ => (
+        _ => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "Failed to get processing statistics".to_string(),
-            }),
-        ).into_response(),
+            "Failed to get processing statistics".to_string()
+        ),
     }
 }
 
@@ -195,7 +199,7 @@ async fn get_summary_stats(State(state): State<AdminState>) -> impl IntoResponse
 async fn list_repos(
     State(state): State<AdminState>,
     Query(params): Query<FilterParams>,
-) -> impl IntoResponse {
+) -> Response {
     let limit = params.limit.unwrap_or(100).min(1000);
     let offset = params.offset.unwrap_or(0);
     
@@ -226,27 +230,21 @@ async fn list_repos(
                 Ok(mut result) => {
                     match result.take::<Vec<serde_json::Value>>(0) {
                         Ok(repos) => (StatusCode::OK, Json(repos)).into_response(),
-                        Err(e) => (
+                        Err(e) => error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("Failed to parse results: {}", e),
-                            }),
-                        ).into_response(),
+                            format!("Failed to parse results: {}", e)
+                        ),
                     }
                 }
-                Err(e) => (
+                Err(e) => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Database query failed: {}", e),
-                    }),
+                    format!("Database query failed: {}", e)
                 ),
             }
         }
-        Err(e) => (
+        Err(e) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("Failed to get database connection: {}", e),
-            }),
+            format!("Failed to get database connection: {}", e)
         ),
     }
 }
@@ -255,7 +253,7 @@ async fn list_repos(
 async fn get_repo_status(
     State(state): State<AdminState>,
     Path(repo_id): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
     let repo_record = RecordId::from(("repo", repo_id.as_str()));
     
     match state.db_pool.get().await {
@@ -270,34 +268,26 @@ async fn get_repo_status(
                 .await {
                 Ok(mut result) => {
                     match result.take::<Option<serde_json::Value>>(0) {
-                        Ok(Some(status)) => (StatusCode::OK, Json(status)),
-                        Ok(None) => (
+                        Ok(Some(status)) => (StatusCode::OK, Json(status)).into_response(),
+                        Ok(None) => error_response(
                             StatusCode::NOT_FOUND,
-                            Json(ErrorResponse {
-                                error: format!("Repository {} not found", repo_id),
-                            }),
+                            format!("Repository {} not found", repo_id)
                         ),
-                        Err(e) => (
+                        Err(e) => error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("Failed to parse result: {}", e),
-                            }),
+                            format!("Failed to parse result: {}", e)
                         ),
                     }
                 }
-                Err(e) => (
+                Err(e) => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Database query failed: {}", e),
-                    }),
+                    format!("Database query failed: {}", e)
                 ),
             }
         }
-        Err(e) => (
+        Err(e) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("Failed to get database connection: {}", e),
-            }),
+            format!("Failed to get database connection: {}", e)
         ),
     }
 }
@@ -307,7 +297,7 @@ async fn reprocess_repo(
     State(state): State<AdminState>,
     Path(repo_id): Path<String>,
     Json(request): Json<ReprocessRequest>,
-) -> impl IntoResponse {
+) -> Response {
     let repo_record = RecordId::from(("repo", repo_id.as_str()));
     let force = request.force.unwrap_or(false);
     
@@ -349,47 +339,33 @@ async fn reprocess_repo(
                     let updated: Vec<serde_json::Value> = match result.take(0) {
                         Ok(u) => u,
                         Err(e) => {
-                            return (
+                            return error_response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ErrorResponse {
-                                    error: format!("Failed to parse update result: {}", e),
-                                }),
+                                format!("Failed to parse update result: {}", e)
                             );
                         }
                     };
                     
                     if updated.is_empty() {
-                        return (
+                        return error_response(
                             StatusCode::BAD_REQUEST,
-                            Json(ErrorResponse {
-                                error: "Repository not found or not eligible for reprocessing".to_string(),
-                            }),
+                            "Repository not found or not eligible for reprocessing".to_string()
                         );
                     }
                     
                     info!("Reset repo {} status for reprocessing", repo_id);
                     
-                    (
-                        StatusCode::OK,
-                        Json(SuccessResponse {
-                            success: true,
-                            message: format!("Repository {} queued for reprocessing", repo_id),
-                        }),
-                    )
+                    success_response(format!("Repository {} queued for reprocessing", repo_id))
                 }
-                Err(e) => (
+                Err(e) => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to reset repository: {}", e),
-                    }),
+                    format!("Failed to reset repository: {}", e)
                 ),
             }
         }
-        Err(e) => (
+        Err(e) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("Failed to get database connection: {}", e),
-            }),
+            format!("Failed to get database connection: {}", e)
         ),
     }
 }
@@ -398,7 +374,7 @@ async fn reprocess_repo(
 async fn reset_repo(
     State(state): State<AdminState>,
     Path(repo_id): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
     let repo_record = RecordId::from(("repo", repo_id.as_str()));
     
     info!("Admin API: Resetting repo {}", repo_id);
@@ -416,34 +392,23 @@ async fn reset_repo(
                 .await {
                 Ok(_) => {
                     info!("Reset processing status for repo {}", repo_id);
-                    
-                    (
-                        StatusCode::OK,
-                        Json(SuccessResponse {
-                            success: true,
-                            message: format!("Repository {} processing status reset", repo_id),
-                        }),
-                    )
+                    success_response(format!("Repository {} processing status reset", repo_id))
                 }
-                Err(e) => (
+                Err(e) => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to reset repository: {}", e),
-                    }),
+                    format!("Failed to reset repository: {}", e)
                 ),
             }
         }
-        Err(e) => (
+        Err(e) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("Failed to get database connection: {}", e),
-            }),
+            format!("Failed to get database connection: {}", e)
         ),
     }
 }
 
 /// Get worker information
-async fn get_worker_info(State(state): State<AdminState>) -> impl IntoResponse {
+async fn get_worker_info(State(state): State<AdminState>) -> Response {
     match state.supervisor.call(
         |reply| ProcessingSupervisorMessage::GetStats(reply),
         Some(Duration::from_secs(5))
@@ -458,13 +423,11 @@ async fn get_worker_info(State(state): State<AdminState>) -> impl IntoResponse {
                 "memory_usage_percent": stats.memory_usage_percent,
             });
             
-            (StatusCode::OK, Json(info))
+            (StatusCode::OK, Json(info)).into_response()
         }
-        _ => (
+        _ => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "Failed to get worker information".to_string(),
-            }),
+            "Failed to get worker information".to_string()
         ),
     }
 }
@@ -473,21 +436,19 @@ async fn get_worker_info(State(state): State<AdminState>) -> impl IntoResponse {
 async fn scale_workers(
     State(_state): State<AdminState>,
     Json(request): Json<ScaleRequest>,
-) -> impl IntoResponse {
+) -> Response {
     // Note: This would require adding a new message type to the supervisor
     // For now, return not implemented
     warn!("Worker scaling requested to {} workers - not implemented", request.workers);
     
-    (
+    error_response(
         StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse {
-            error: "Worker scaling not yet implemented".to_string(),
-        }),
+        "Worker scaling not yet implemented".to_string()
     )
 }
 
 /// Get queue information
-async fn get_queue_info(State(state): State<AdminState>) -> impl IntoResponse {
+async fn get_queue_info(State(state): State<AdminState>) -> Response {
     match state.supervisor.call(
         |reply| ProcessingSupervisorMessage::GetStats(reply),
         Some(Duration::from_secs(5))
@@ -499,27 +460,23 @@ async fn get_queue_info(State(state): State<AdminState>) -> impl IntoResponse {
                 "processing_rate": "N/A", // Would need to track this
             });
             
-            (StatusCode::OK, Json(info))
+            (StatusCode::OK, Json(info)).into_response()
         }
-        _ => (
+        _ => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "Failed to get queue information".to_string(),
-            }),
+            "Failed to get queue information".to_string()
         ),
     }
 }
 
 /// Clear the queue (emergency use)
-async fn clear_queue(State(_state): State<AdminState>) -> impl IntoResponse {
+async fn clear_queue(State(_state): State<AdminState>) -> Response {
     // This would require adding queue management to the factory
     warn!("Queue clear requested - not implemented");
     
-    (
+    error_response(
         StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse {
-            error: "Queue clearing not yet implemented".to_string(),
-        }),
+        "Queue clearing not yet implemented".to_string()
     )
 }
 
@@ -527,7 +484,7 @@ async fn clear_queue(State(_state): State<AdminState>) -> impl IntoResponse {
 async fn reprocess_user(
     State(state): State<AdminState>,
     Path(user_id): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
     let user_record = RecordId::from(("user", user_id.as_str()));
     
     info!("Admin API: Reprocessing all repos for user {}", user_id);
@@ -550,33 +507,27 @@ async fn reprocess_user(
                     let accounts: Vec<serde_json::Value> = match result.take(0) {
                         Ok(a) => a,
                         Err(e) => {
-                            return (
+                            return error_response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ErrorResponse {
-                                    error: format!("Failed to parse accounts: {}", e),
-                                }),
+                                format!("Failed to parse accounts: {}", e)
                             );
                         }
                     };
                     
                     if accounts.is_empty() {
-                        return (
+                        return error_response(
                             StatusCode::NOT_FOUND,
-                            Json(ErrorResponse {
-                                error: format!("No GitHub account found for user {}", user_id),
-                            }),
+                            format!("No GitHub account found for user {}", user_id)
                         );
                     }
                     
                     // Extract access token
-                    let access_token = match accounts[0].get("access_token").and_then(|v| v.as_str()) {
+                    let _access_token = match accounts[0].get("access_token").and_then(|v| v.as_str()) {
                         Some(token) => token.to_string(),
                         None => {
-                            return (
+                            return error_response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ErrorResponse {
-                                    error: "Failed to get access token".to_string(),
-                                }),
+                                "Failed to get access token".to_string()
                             );
                         }
                     };
@@ -604,62 +555,48 @@ async fn reprocess_user(
                             // Note: This would require access to the factory through the supervisor
                             // For now, just reset the status
                             
-                            (
-                                StatusCode::OK,
-                                Json(SuccessResponse {
-                                    success: true,
-                                    message: format!("All repositories for user {} queued for reprocessing", user_id),
-                                }),
+                            success_response(
+                                format!("All repositories for user {} queued for reprocessing", user_id)
                             )
                         }
-                        Err(e) => (
+                        Err(e) => error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("Failed to reset repositories: {}", e),
-                            }),
+                            format!("Failed to reset repositories: {}", e)
                         ),
                     }
                 }
-                Err(e) => (
+                Err(e) => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to get account: {}", e),
-                    }),
+                    format!("Failed to get account: {}", e)
                 ),
             }
         }
-        Err(e) => (
+        Err(e) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("Failed to get database connection: {}", e),
-            }),
+            format!("Failed to get database connection: {}", e)
         ),
     }
 }
 
 /// Pause processing (stop accepting new jobs)
-async fn pause_processing(State(_state): State<AdminState>) -> impl IntoResponse {
+async fn pause_processing(State(_state): State<AdminState>) -> Response {
     // This would require adding pause functionality to the supervisor
     warn!("Processing pause requested - not implemented");
     
-    (
+    error_response(
         StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse {
-            error: "Pause functionality not yet implemented".to_string(),
-        }),
+        "Pause functionality not yet implemented".to_string()
     )
 }
 
 /// Resume processing
-async fn resume_processing(State(_state): State<AdminState>) -> impl IntoResponse {
+async fn resume_processing(State(_state): State<AdminState>) -> Response {
     // This would require adding resume functionality to the supervisor
     warn!("Processing resume requested - not implemented");
     
-    (
+    error_response(
         StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse {
-            error: "Resume functionality not yet implemented".to_string(),
-        }),
+        "Resume functionality not yet implemented".to_string()
     )
 }
 

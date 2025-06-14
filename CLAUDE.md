@@ -79,6 +79,13 @@ DB_DATABASE=stars       # Must match Next.js app
 DB_POOL_MAX_SIZE=10
 DB_POOL_MIN_IDLE=2
 DB_CONNECTION_TIMEOUT=30
+
+# Health Check Server (optional)
+HEALTH_PORT=8080  # Set to 0 to disable
+
+# Admin API Server (optional)
+ADMIN_PORT=8081   # Set to 0 to disable
+ADMIN_API_KEY=your-secret-api-key  # Required if admin port is enabled
 ```
 
 2. Start SurrealDB (if not already running):
@@ -101,6 +108,10 @@ cargo run -- --db-url ws://localhost:8000 --db-user root --db-pass root
 # Run with custom pool configuration
 cargo run -- --db-pool-max-size 20 --db-pool-min-idle 5
 
+# Run with admin API enabled
+cargo run -- --admin-port 8081
+# Note: Set ADMIN_API_KEY environment variable first
+
 # Show all available options
 cargo run -- --help
 ```
@@ -117,6 +128,8 @@ cargo run -- --help
 - `--db-pool-min-idle <N>` - Minimum idle connections (default: 2)
 - `--db-connection-timeout <SECS>` - Connection timeout in seconds (default: 30)
 - `--health-port <PORT>` - Health check server port (default: 8080, set to 0 to disable)
+- `--admin-port <PORT>` - Admin API server port (default: 8081, set to 0 to disable)
+- `--admin-api-key <KEY>` - Admin API authentication key (required if admin port is enabled)
 
 ### Server Architecture
 
@@ -187,6 +200,61 @@ The server integrates with a Next.js application that:
 3. Creates account and repo records in SurrealDB
 4. The server detects these via live queries and processes stargazers
 
+### Admin API
+
+The admin API provides authenticated access to system management functions:
+
+#### Authentication
+All admin API endpoints require Bearer token authentication:
+```bash
+curl -H "Authorization: Bearer your-secret-api-key" http://localhost:8081/stats
+```
+
+#### Endpoints
+
+**Statistics:**
+- `GET /stats` - Detailed statistics including processing, database, and queue info
+- `GET /stats/summary` - Summary statistics from the processing supervisor
+
+**Repository Management:**
+- `GET /repos?status=failed&limit=100&offset=0` - List repositories with optional filtering
+- `GET /repos/:repo_id` - Get specific repository processing status
+- `POST /repos/:repo_id/reprocess` - Reprocess a repository (optionally with `{"force": true}`)
+- `POST /repos/:repo_id/reset` - Reset repository processing status
+
+**Worker Management:**
+- `GET /workers` - Get worker information (active, idle, queue depth, resources)
+- `POST /workers/scale` - Scale workers (not yet implemented)
+
+**Queue Management:**
+- `GET /queue` - Get queue information
+- `POST /queue/clear` - Clear the queue (not yet implemented)
+
+**User Management:**
+- `POST /users/:user_id/reprocess` - Reprocess all repositories for a user
+
+**System Control:**
+- `POST /pause` - Pause processing (not yet implemented)
+- `POST /resume` - Resume processing (not yet implemented)
+
+#### Example Usage
+```bash
+# Get system stats
+curl -H "Authorization: Bearer your-secret-api-key" http://localhost:8081/stats
+
+# List failed repos
+curl -H "Authorization: Bearer your-secret-api-key" http://localhost:8081/repos?status=failed
+
+# Reprocess a specific repo
+curl -X POST -H "Authorization: Bearer your-secret-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"force": true}' \
+  http://localhost:8081/repos/123456/reprocess
+
+# Get worker information
+curl -H "Authorization: Bearer your-secret-api-key" http://localhost:8081/workers
+```
+
 ### Performance Considerations
 
 - **Connection Pool**: Scales database operations with worker count
@@ -212,6 +280,17 @@ The server integrates with a Next.js application that:
   - `/livez` - Kubernetes liveness probe (simple alive check)
   - `/readyz` - Kubernetes readiness probe (checks DB and supervisor)
   - Returns 503 when unhealthy, 200 when healthy/degraded
+- **Admin API**: Authenticated REST API for system management (port 8081)
+  - `/stats` - Get detailed system statistics
+  - `/stats/summary` - Get summary statistics
+  - `/repos` - List repositories with filtering
+  - `/repos/:id` - Get specific repository status
+  - `/repos/:id/reprocess` - Reprocess a repository
+  - `/repos/:id/reset` - Reset repository processing status
+  - `/workers` - Get worker information
+  - `/queue` - Get queue information
+  - `/users/:id/reprocess` - Reprocess all repos for a user
+  - Authentication via Bearer token in Authorization header
 - **Graceful Shutdown**: Ctrl+C triggers clean shutdown with final stats
 
 ### Dependencies
@@ -227,3 +306,5 @@ Key dependencies include:
 - `sysinfo` - System resource monitoring
 - `chrono` - Date/time handling
 - `serde` - Serialization/deserialization
+- `axum` - HTTP framework for health checks and admin API
+- `tower` - Middleware framework for authentication
