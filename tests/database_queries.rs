@@ -17,8 +17,8 @@ async fn test_get_github_accounts() {
     let ctx = TestContext::new().await.expect("Failed to create test context");
     let db_client = ctx.db_client.lock().await;
     
-    // Get GitHub accounts with a limit
-    let accounts = db_client.get_github_accounts(10).await;
+    // Get GitHub accounts with a limit and offset
+    let accounts = db_client.get_github_accounts(10, 0).await;
     
     // This might return empty if no accounts exist
     assert!(accounts.is_ok(), "Failed to get GitHub accounts");
@@ -143,8 +143,9 @@ async fn test_processing_stats() {
     let stats = db_client.get_processing_stats().await
         .expect("Failed to get processing stats");
     
-    // Stats should be a valid JSON value
-    assert!(stats.is_object());
+    // Stats should have valid fields
+    println!("Processing stats - Completed: {}, Failed: {}, Processing: {}", 
+        stats.completed, stats.failed, stats.processing);
 }
 
 #[tokio::test]
