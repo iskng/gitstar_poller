@@ -1,4 +1,6 @@
 mod actors;
+mod admin;
+mod auth;
 mod cli;
 mod error;
 mod github;
@@ -10,6 +12,9 @@ mod types;
 
 use actors::{ ProcessingSupervisor, ProcessingSupervisorMessage };
 use actors::github_factory::GitHubFactoryConfig;
+use admin::{AdminState, create_admin_router};
+use auth::auth_middleware;
+use axum::middleware;
 use clap::Parser;
 use cli::Cli;
 use colored::*;
@@ -123,6 +128,53 @@ async fn main() -> Result<()> {
         None
     };
     
+    // Start admin API server if enabled
+    let admin_handle = if cli.admin_port > 0 {
+        // Check if API key is provided
+        let api_key = match cli.admin_api_key.clone() {
+            Some(key) if !key.is_empty() => key,
+            _ => {
+                eprintln!("⚠️  Warning: Admin API enabled but no API key provided!");
+                eprintln!("   Set ADMIN_API_KEY environment variable for security");
+                return Err(GitHubStarsError::ApiError(
+                    "Admin API requires an API key. Set ADMIN_API_KEY environment variable.".into()
+                ));
+            }
+        };
+        
+        let admin_state = AdminState {
+            db_pool: db_pool.clone(),
+            supervisor: supervisor.clone(),
+        };
+        
+        let admin_port = cli.admin_port;
+        let handle = tokio::spawn(async move {
+            // Create router with authentication
+            let app = create_admin_router(admin_state)
+                .layer(middleware::from_fn(move |req, next| {
+                    let api_key = api_key.clone();
+                    auth_middleware(api_key, req, next)
+                }));
+            
+            let addr = format!("0.0.0.0:{}", admin_port);
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    println!("🔧 Admin API server listening on http://{}", addr);
+                    if let Err(e) = axum::serve(listener, app).await {
+                        eprintln!("Admin API server error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to bind admin API server: {}", e);
+                }
+            }
+        });
+        
+        Some(handle)
+    } else {
+        None
+    };
+    
     println!("\nPress Ctrl+C to stop the server\n");
 
     // Set up graceful shutdown
@@ -171,6 +223,12 @@ async fn main() -> Result<()> {
             if let Some(handle) = health_handle {
                 handle.abort();
                 println!("✅ Health check server stopped");
+            }
+            
+            // Stop admin API server if running
+            if let Some(handle) = admin_handle {
+                handle.abort();
+                println!("✅ Admin API server stopped");
             }
             
             println!("✅ Server stopped");

@@ -1,4 +1,6 @@
 pub mod actors;
+pub mod admin;
+pub mod auth;
 pub mod error;
 pub mod github;
 pub mod health;

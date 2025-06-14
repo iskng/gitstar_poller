@@ -46,4 +46,12 @@ pub struct Cli {
     /// Health check server port (0 to disable)
     #[arg(long, env = "HEALTH_PORT", default_value = "8080")]
     pub health_port: u16,
+
+    /// Admin API server port (0 to disable)
+    #[arg(long, env = "ADMIN_PORT", default_value = "8081")]
+    pub admin_port: u16,
+
+    /// Admin API key for authentication (required if admin port is enabled)
+    #[arg(long, env = "ADMIN_API_KEY")]
+    pub admin_api_key: Option<String>,
 }
